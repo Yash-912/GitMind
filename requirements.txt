@@ -1,0 +1,23 @@
+# Phase 1 — Data Infrastructure
+gitpython
+PyGithub
+httpx
+tenacity
+sqlmodel
+pydantic-settings
+python-dotenv
+
+# Phase 2 — Parsing, Entities & Chunking
+unidiff                     # structured diff parsing
+tree-sitter>=0.21           # AST-based code parsing
+tree-sitter-python          # Python grammar for tree-sitter
+spacy>=3.7                  # NER entity extraction (run: python -m spacy download en_core_web_sm)
+rapidfuzz                   # fuzzy entity alias resolution
+markdownify                 # HTML → Markdown conversion
+beautifulsoup4              # HTML parsing fallback
+keybert                     # unsupervised keyphrase extraction
+tiktoken                    # token counting for context assembly
+
+# Dev / Testing
+pytest
+pytest-asyncio

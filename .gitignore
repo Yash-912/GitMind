@@ -1,0 +1,108 @@
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ========================
+# Environment & Secrets
+# ========================
+.env
+.env.local
+.env.*.local
+
+# ========================
+# Data & Artifacts
+# ========================
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ========================
+# Qdrant (local vector store)
+# ========================
+.qdrant/
+
+# ========================
+# Embedding cache (diskcache)
+# ========================
+.diskcache/
+cache/
+
+# ========================
+# BM25 index
+# ========================
+*.bm25
+bm25_index/
+
+# ========================
+# Ollama / Model files
+# ========================
+*.gguf
+*.bin
+
+# ========================
+# MLflow experiment tracking
+# ========================
+mlruns/
+mlflow.db
+
+# ========================
+# Notebooks checkpoints
+# ========================
+.ipynb_checkpoints/
+
+# ========================
+# IDE / Editor
+# ========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ========================
+# OS junk
+# ========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ========================
+# Virtual environments
+# ========================
+venv/
+.venv/
+env/
+
+# ========================
+# Testing & Coverage
+# ========================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+
+# ========================
+# Logs
+# ========================
+*.log
+logs/
+
+# ========================
+# Cloned repos (ingestion)
+# ========================
+repos/
+cloned_repos/

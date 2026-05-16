@@ -119,8 +119,8 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 │                     CHUNKING & EMBEDDING                                │
 │                                                                         │
 │  Per-Type Chunker ──► Dual Embedding                                    │
-│  (code / prose /        Code: text-embedding-3-small (OpenAI)           │
-│   diff / issue)         Prose: same model, different prompt prefix      │
+│  (code / prose /        Prose: nomic-embed-text (Ollama, local)         │
+│   diff / issue)         Code: nomic-embed-code (Ollama, local)          │
 │                                    │                                    │
 │                                    ▼                                    │
 │              Qdrant Vector Store (metadata-rich payload)                │
@@ -150,7 +150,7 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                       GENERATION LAYER                                  │
 │                                                                         │
-│  Context Assembler ──► Prompt Builder ──► LLM (GPT-4o / Claude)        │
+│  Context Assembler ──► Prompt Builder ──► LLM (Gemini 2.0 Flash)       │
 │                                                    │                    │
 │                            ┌───────────────────────┤                    │
 │                            │                       │                    │
@@ -197,7 +197,6 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 
 | Component | Technology | Why |
 |---|---|---|
-| Semantic chunking for prose | `langchain_text_splitters.SemanticChunker` | Splits on meaning boundaries, not character count |
 | Code-aware chunking | Custom splitter using `tree-sitter` AST | Respects function/class boundaries in diffs |
 | Diff chunking | Custom hunk-aware splitter on top of `unidiff` | Keeps file path + hunk context intact |
 | Chunk metadata attachment | Custom `ChunkMetadata` dataclass | Stamps every chunk with type, timestamp, author, entity tags, graph node ID |
@@ -206,11 +205,10 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 
 | Component | Technology | Why |
 |---|---|---|
-| Primary embedding model | `text-embedding-3-small` (OpenAI API) | Strong performance, cheap at scale, 1536 dims |
-| Local fallback / offline | `sentence-transformers/all-MiniLM-L6-v2` | No API cost, good baseline, runs on CPU |
-| Code-specific embedding | `voyage-code-2` (VoyageAI API) or `nomic-embed-code` | Trained on code, outperforms general models on diffs |
+| Prose embedding model | `nomic-embed-text` via Ollama (local) | Zero cost, no API key, 768 dims, strong prose performance |
+| Code-specific embedding | `nomic-embed-code` via Ollama (local) | Zero cost, trained on code, outperforms general models on diffs |
 | Embedding cache | `diskcache` | Avoids re-embedding unchanged chunks across re-ingestions |
-| Batch embedding | Custom async batcher with `asyncio` + `httpx` | Efficient bulk embedding with rate limit handling |
+| Batch embedding | Custom batcher via Ollama REST API (`httpx`) | Efficient bulk embedding, no rate limits (local) |
 
 ### 5.5 Vector Store & Indexes
 
@@ -225,7 +223,7 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 
 | Component | Technology | Why |
 |---|---|---|
-| Query decomposition | `GPT-4o-mini` with structured output (JSON mode) | Cheap, fast, good at extraction tasks |
+| Query decomposition | `Gemini 2.0 Flash` with structured output (JSON mode) | Fast, free tier available, good at extraction tasks |
 | Hybrid retrieval orchestration | Custom `HybridRetriever` class | Coordinates Qdrant + BM25 + metadata filter |
 | Cross-encoder reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers` | Best open-source reranker, runs locally, massive quality improvement |
 | Graph walking | Custom `TemporalGraphWalker` on SQLite adjacency list | Expands retrieved nodes to causally linked documents |
@@ -235,10 +233,10 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 
 | Component | Technology | Why |
 |---|---|---|
-| Primary LLM | `GPT-4o` via OpenAI API | Best reasoning for multi-hop, citation-aware generation |
+| Primary LLM | `Gemini 2.0 Flash` via Google AI Studio | Fast, generous free tier, strong reasoning for multi-hop generation |
 | Fallback / local LLM | `Ollama` + `mistral` or `llama3` | Zero-cost local option, works offline |
-| LLM orchestration | `LangChain` LCEL (minimal usage) or raw API calls | Keeps the pipeline transparent and debuggable |
-| Structured output | Pydantic models + OpenAI JSON mode | Guarantees parseable responses for Decision Memos and Blame Maps |
+| LLM orchestration | `google-genai` SDK or raw API calls | Keeps the pipeline transparent and debuggable |
+| Structured output | Pydantic models + Gemini JSON mode | Guarantees parseable responses for Decision Memos and Blame Maps |
 | Prompt management | `Jinja2` templates | Separates prompt logic from Python code, version-controllable |
 
 ### 5.8 Storage & State
@@ -256,9 +254,9 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 | Component | Technology | Why |
 |---|---|---|
 | Core RAG evaluation | `RAGAS` | Industry standard: Faithfulness, Answer Relevancy, Context Precision/Recall |
-| LLM judge for evaluation | `GPT-4o` (via RAGAS config) | RAGAS uses LLM-as-judge internally |
+| LLM judge for evaluation | `Gemini 2.0 Flash` (via RAGAS config) | RAGAS uses LLM-as-judge internally |
 | Custom metric framework | `RAGAS` custom metrics API | For temporal accuracy, multi-hop score, entity F1 |
-| Evaluation dataset creation | Semi-synthetic: real repo + GPT-4o generated Q&A | Realistic ground truth without manual labeling |
+| Evaluation dataset creation | Semi-synthetic: real repo + Gemini 2.0 Flash generated Q&A | Realistic ground truth without manual labeling |
 | Experiment tracking | `MLflow` (local) | Log metric runs, compare chunking/retrieval configs |
 
 ### 5.10 Interface & Developer Experience
@@ -377,8 +375,8 @@ class ChunkMetadata:
 ### 8.1 Dual Embedding Strategy
 
 Each chunk gets embedded twice:
-- **Semantic embedding**: `text-embedding-3-small` with a prose-optimized prefix for commit messages, issue text, PR bodies
-- **Code embedding**: `voyage-code-2` for diff chunks and code file chunks
+- **Semantic embedding**: `nomic-embed-text` via Ollama (local, zero cost) for commit messages, issue text, PR bodies
+- **Code embedding**: `nomic-embed-code` via Ollama (local, zero cost) for diff chunks and code file chunks
 
 Both vectors are stored in Qdrant as named vectors on the same point. Retrieval queries both and fuses results.
 
@@ -389,8 +387,8 @@ Both vectors are stored in Qdrant as named vectors on the same point. Retrieval 
 {
   "id": "<chunk_uuid>",
   "vectors": {
-    "semantic": [...],   # 1536-dim from text-embedding-3-small
-    "code": [...]        # 1024-dim from voyage-code-2
+    "semantic": [...],   # 768-dim from nomic-embed-text (Ollama)
+    "code": [...]        # 768-dim from nomic-embed-code (Ollama)
   },
   "payload": {
     # Full ChunkMetadata fields
@@ -445,7 +443,7 @@ This enables fast exact-match + fuzzy entity resolution before semantic search.
 Raw Query
     │
     ▼
-Query Decomposer (GPT-4o-mini, JSON output)
+Query Decomposer (Gemini 2.0 Flash, JSON output)
     ├── extracted_entities: ["auth module", "JWT"]
     ├── time_range: {"start": "2021-01-01", "end": "2022-12-31"}
     ├── intent: "decision_archaeology"
@@ -619,7 +617,7 @@ class EntityConsistencyMetric(Metric):
 Creating a ground-truth evaluation dataset without manual labeling:
 
 **Step 1: Synthetic QA Generation**
-For each high-confidence retrieved cluster (a PR + its linked commits + issues), use GPT-4o to generate realistic questions a developer might ask, with reference answers derived strictly from the cluster.
+For each high-confidence retrieved cluster (a PR + its linked commits + issues), use Gemini 2.0 Flash to generate realistic questions a developer might ask, with reference answers derived strictly from the cluster.
 
 **Step 2: Adversarial Questions**
 Generate questions where the answer is *not* in the corpus (to test hallucination resistance). Correct behavior: "I couldn't find clear evidence for this in the repository history."
@@ -637,7 +635,7 @@ import mlflow
 
 with mlflow.start_run(run_name="hybrid_retrieval_v3"):
     mlflow.log_params({
-        "embedding_model": "text-embedding-3-small",
+        "embedding_model": "nomic-embed-text / nomic-embed-code (Ollama)",
         "reranker": "ms-marco-MiniLM-L-6-v2",
         "top_k": 12,
         "graph_hop_depth": 1,
@@ -708,7 +706,7 @@ with mlflow.start_run(run_name="hybrid_retrieval_v3"):
 
 ### Phase 4: Retrieval Pipeline (Week 6–7)
 
-- [ ] Implement `QueryDecomposer` using GPT-4o-mini with JSON output
+- [ ] Implement `QueryDecomposer` using Gemini 2.0 Flash with JSON output
 - [ ] Implement `EntityResolver` using FTS5 index
 - [ ] Implement `HybridRetriever` with RRF fusion
 - [ ] Implement `TemporalGraphWalker`
@@ -737,7 +735,7 @@ with mlflow.start_run(run_name="hybrid_retrieval_v3"):
 
 ### Phase 6: Evaluation (Week 9–10)
 
-- [ ] Build synthetic evaluation dataset (100 QA pairs) using GPT-4o
+- [ ] Build synthetic evaluation dataset (100 QA pairs) using Gemini 2.0 Flash
 - [ ] Include adversarial, temporal, and multi-hop question types
 - [ ] Set up RAGAS evaluation pipeline
 - [ ] Implement three custom RAGAS metrics
@@ -818,7 +816,7 @@ gitmind/
 │   └── fts_index.py            # SQLite FTS5 entity index
 │
 ├── retrieval/
-│   ├── query_decomposer.py     # GPT-4o-mini structured query decomposition
+│   ├── query_decomposer.py     # Gemini 2.0 Flash structured query decomposition
 │   ├── entity_resolver.py      # FTS5-based entity lookup
 │   ├── hybrid_retriever.py     # Dense + sparse + RRF fusion
 │   ├── graph_walker.py         # Temporal graph expansion
@@ -826,7 +824,7 @@ gitmind/
 │   └── context_assembler.py    # Token-budget-aware context builder
 │
 ├── generation/
-│   ├── llm_client.py           # OpenAI + Ollama abstraction
+│   ├── llm_client.py           # Gemini + Ollama abstraction
 │   ├── prompt_templates/
 │   │   ├── direct_qa.j2
 │   │   ├── decision_memo.j2
@@ -896,4 +894,4 @@ gitmind/
 
 ---
 
-*Document version: 1.0 | Project: GitMind | Status: Pre-build*
+*Document version: 1.1 | Project: GitMind | Status: Phase 2 complete | Embedding: nomic-embed-text/code (Ollama) | LLM: Gemini 2.0 Flash*
