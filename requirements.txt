@@ -18,6 +18,12 @@ beautifulsoup4              # HTML parsing fallback
 keybert                     # unsupervised keyphrase extraction
 tiktoken                    # token counting for context assembly
 
+# Phase 3 — Embedding & Indexing
+qdrant-client>=1.9          # local-mode vector store with named vectors
+bm25s                       # pure-Python BM25 sparse index
+PyStemmer                   # stemmer backend for bm25s
+diskcache                   # persistent embedding cache
+
 # Dev / Testing
 pytest
 pytest-asyncio
