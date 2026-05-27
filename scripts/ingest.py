@@ -44,8 +44,20 @@ def main() -> None:
         print("[github] collecting issues...")
         issues = gh_collector.collect_issues()
         print(f"[github] collected {len(issues)} issues")
+        print("[github] collecting releases...")
+        releases = gh_collector.collect_releases()
+        print(f"[github] collected {len(releases)} releases")
+        print("[github] collecting CI/CD runs...")
+        runs = gh_collector.collect_workflow_runs()
+        print(f"[github] collected {len(runs)} workflow runs")
+        print("[github] collecting PR timeline via GraphQL...")
+        pr_graphql = gh_collector.collect_prs_graphql()
+        print(f"[github] collected {len(pr_graphql)} GraphQL PR records")
         store.upsert_many("pr", [p.__dict__ for p in prs], id_key="number")
         store.upsert_many("issue", [i.__dict__ for i in issues], id_key="number")
+        store.upsert_many("release", [r.__dict__ for r in releases], id_key="tag")
+        store.upsert_many("cicd", [r.__dict__ for r in runs], id_key="run_id")
+        store.upsert_many("pr_graphql", [r.__dict__ for r in pr_graphql], id_key="number")
         print("[github] stored PRs and issues")
 
         linker = CrossReferenceLinker()
@@ -57,6 +69,24 @@ def main() -> None:
             id_key="link_id",
         )
         print(f"[linker] stored {len(pr_issue_links) + len(commit_pr_links)} links")
+
+    # Local CHANGELOG ingestion (optional)
+    changelog_path = Path(args.repo_path) / "CHANGELOG.md"
+    if changelog_path.exists():
+        body = changelog_path.read_text(encoding="utf-8", errors="replace")
+        store.upsert_many(
+            "release",
+            [
+                {
+                    "tag": "CHANGELOG",
+                    "name": "CHANGELOG",
+                    "body": body,
+                    "created_at": None,
+                    "published_at": None,
+                }
+            ],
+            id_key="tag",
+        )
 
     with Session(store.engine) as session:
         checkpoint_store = CheckpointStore(session)

@@ -7,6 +7,7 @@ from typing import Iterable
 
 from github import Github
 from github.GithubException import GithubException
+import httpx
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,40 @@ class IssueRecord:
     comments: list[str]
 
 
+@dataclass(frozen=True)
+class ReleaseRecord:
+    tag: str
+    name: str
+    body: str
+    created_at: str | None
+    published_at: str | None
+
+
+@dataclass(frozen=True)
+class WorkflowRunRecord:
+    run_id: int
+    name: str
+    status: str
+    conclusion: str | None
+    created_at: str
+    updated_at: str
+    html_url: str
+    event: str
+    branch: str
+    actor: str
+
+
+@dataclass(frozen=True)
+class GraphQLPRRecord:
+    number: int
+    title: str
+    body: str
+    author: str
+    created_at: str | None
+    merged_at: str | None
+    closing_issues: list[str]
+
+
 def _dt(dt: datetime | None) -> str | None:
     if dt is None:
         return None
@@ -49,6 +84,12 @@ class GitHubAPICollector:
     def __init__(self, token: str, repo_full_name: str) -> None:
         self.client = Github(token, per_page=100)
         self.repo = self.client.get_repo(repo_full_name)
+        self.token = token
+        self.repo_full_name = repo_full_name
+        if "/" in repo_full_name:
+            self.owner, self.repo_name = repo_full_name.split("/", 1)
+        else:
+            self.owner, self.repo_name = "", repo_full_name
 
     def _throttle(self) -> None:
         rate_overview = self.client.get_rate_limit()
@@ -128,3 +169,107 @@ class GitHubAPICollector:
 
     def collect_issues(self, state: str = "all", log_every: int = 50) -> list[IssueRecord]:
         return list(self.iter_issues(state=state, log_every=log_every))
+
+    def collect_releases(self, log_every: int = 20) -> list[ReleaseRecord]:
+        releases = []
+        for idx, rel in enumerate(self._iter_with_throttle(self.repo.get_releases()), start=1):
+            if log_every and idx % log_every == 0:
+                print(f"[github] pulled {idx} releases...")
+            releases.append(
+                ReleaseRecord(
+                    tag=rel.tag_name or "",
+                    name=rel.title or "",
+                    body=rel.body or "",
+                    created_at=_dt(rel.created_at),
+                    published_at=_dt(rel.published_at),
+                )
+            )
+        return releases
+
+    def collect_workflow_runs(self, per_page: int = 50, limit: int = 200) -> list[WorkflowRunRecord]:
+        if not self.owner:
+            return []
+        url = f"https://api.github.com/repos/{self.owner}/{self.repo_name}/actions/runs"
+        headers = {"Authorization": f"token {self.token}", "Accept": "application/vnd.github+json"}
+        runs: list[WorkflowRunRecord] = []
+        page = 1
+        with httpx.Client(timeout=60.0) as client:
+            while len(runs) < limit:
+                resp = client.get(url, headers=headers, params={"per_page": per_page, "page": page})
+                resp.raise_for_status()
+                data = resp.json()
+                for run in data.get("workflow_runs", []):
+                    runs.append(
+                        WorkflowRunRecord(
+                            run_id=int(run.get("id", 0)),
+                            name=run.get("name", ""),
+                            status=run.get("status", ""),
+                            conclusion=run.get("conclusion"),
+                            created_at=run.get("created_at", ""),
+                            updated_at=run.get("updated_at", ""),
+                            html_url=run.get("html_url", ""),
+                            event=run.get("event", ""),
+                            branch=run.get("head_branch", ""),
+                            actor=(run.get("actor") or {}).get("login", ""),
+                        )
+                    )
+                    if len(runs) >= limit:
+                        break
+                if len(data.get("workflow_runs", [])) < per_page:
+                    break
+                page += 1
+        return runs
+
+    def collect_prs_graphql(self, limit: int = 50) -> list[GraphQLPRRecord]:
+        if not self.owner:
+            return []
+        query = """
+        query($owner: String!, $name: String!, $limit: Int!) {
+          repository(owner: $owner, name: $name) {
+            pullRequests(last: $limit, states: MERGED, orderBy: {field: UPDATED_AT, direction: DESC}) {
+              nodes {
+                number
+                title
+                bodyText
+                createdAt
+                mergedAt
+                author { login }
+                closingIssuesReferences(first: 5) {
+                  nodes { number title }
+                }
+              }
+            }
+          }
+        }
+        """
+        headers = {"Authorization": f"token {self.token}", "Accept": "application/vnd.github+json"}
+        payload = {
+            "query": query,
+            "variables": {"owner": self.owner, "name": self.repo_name, "limit": limit},
+        }
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post("https://api.github.com/graphql", headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        nodes = (
+            data.get("data", {})
+            .get("repository", {})
+            .get("pullRequests", {})
+            .get("nodes", [])
+        )
+        records: list[GraphQLPRRecord] = []
+        for pr in nodes:
+            issues = pr.get("closingIssuesReferences", {}).get("nodes", [])
+            closing = [f"#{i.get('number')}: {i.get('title')}" for i in issues]
+            records.append(
+                GraphQLPRRecord(
+                    number=int(pr.get("number", 0)),
+                    title=pr.get("title", ""),
+                    body=pr.get("bodyText", ""),
+                    author=(pr.get("author") or {}).get("login", ""),
+                    created_at=pr.get("createdAt"),
+                    merged_at=pr.get("mergedAt"),
+                    closing_issues=closing,
+                )
+            )
+        return records

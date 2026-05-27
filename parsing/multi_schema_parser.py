@@ -57,6 +57,32 @@ class ParsedRelease:
     body_clean: str
 
 
+@dataclass
+class ParsedCICD:
+    run_id: int
+    name: str
+    status: str
+    conclusion: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+    html_url: str
+    event: str
+    branch: str
+    actor: str
+    body_clean: str
+
+
+@dataclass
+class ParsedPRGraphQL:
+    number: int
+    title: str
+    body_clean: str
+    author: str
+    created_at: datetime | None
+    merged_at: datetime | None
+    closing_issues: list[str]
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -149,4 +175,41 @@ class MultiSchemaParser:
             tag=payload.get("tag", payload.get("tag_name", "")),
             timestamp=_parse_dt(payload.get("timestamp") or payload.get("published_at")),
             body_clean=body_clean,
+        )
+
+    def parse_cicd(self, payload: dict[str, Any]) -> ParsedCICD:
+        summary = (
+            f"Run: {payload.get('name', '')}\n"
+            f"Status: {payload.get('status', '')}\n"
+            f"Conclusion: {payload.get('conclusion', '')}\n"
+            f"Event: {payload.get('event', '')}\n"
+            f"Branch: {payload.get('branch', '')}\n"
+            f"Actor: {payload.get('actor', '')}\n"
+            f"URL: {payload.get('html_url', '')}"
+        )
+        return ParsedCICD(
+            run_id=int(payload.get("run_id", 0)),
+            name=payload.get("name", ""),
+            status=payload.get("status", ""),
+            conclusion=payload.get("conclusion"),
+            created_at=_parse_dt(payload.get("created_at")),
+            updated_at=_parse_dt(payload.get("updated_at")),
+            html_url=payload.get("html_url", ""),
+            event=payload.get("event", ""),
+            branch=payload.get("branch", ""),
+            actor=payload.get("actor", ""),
+            body_clean=summary,
+        )
+
+    def parse_pr_graphql(self, payload: dict[str, Any]) -> ParsedPRGraphQL:
+        body_raw: str = payload.get("body", "") or ""
+        body_clean = self._cleaner.clean_markdown(body_raw)
+        return ParsedPRGraphQL(
+            number=int(payload.get("number", 0)),
+            title=payload.get("title", "") or "",
+            body_clean=body_clean,
+            author=payload.get("author", "") or "",
+            created_at=_parse_dt(payload.get("created_at")),
+            merged_at=_parse_dt(payload.get("merged_at")),
+            closing_issues=payload.get("closing_issues", []) or [],
         )

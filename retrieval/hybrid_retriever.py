@@ -23,6 +23,8 @@ class HybridRetriever:
         chunk_store: ChunkStore,
         embedder: QueryEmbedder | None = None,
         rrf_k: int = 60,
+        use_code_search: bool = True,
+        source_weights: dict[str, float] | None = None,
     ) -> None:
         self.qdrant = qdrant
         self.bm25 = bm25
@@ -30,6 +32,13 @@ class HybridRetriever:
         self.chunk_store = chunk_store
         self.embedder = embedder or QueryEmbedder()
         self.rrf_k = rrf_k
+        self.use_code_search = use_code_search
+        self.source_weights = source_weights or {
+            "qdrant_semantic": 1.0,
+            "qdrant_code": 0.8,
+            "bm25": 0.7,
+            "fts": 0.6,
+        }
 
     def retrieve(
         self,
@@ -51,6 +60,13 @@ class HybridRetriever:
             limit=limit,
             query_filter=q_filter,
         )
+        code_results = []
+        if self.use_code_search and hasattr(self.qdrant, "search_code"):
+            code_results = self.qdrant.search_code(
+                query_vector=query_vector,
+                limit=limit,
+                query_filter=q_filter,
+            )
         bm25_results = self.bm25.search(query, limit=limit)
         fts_results = self.fts.search(query, limit=limit)
 
@@ -58,15 +74,23 @@ class HybridRetriever:
         sources: dict[str, str] = {}
 
         for rank, r in enumerate(dense_results):
-            scores[r.chunk_id] += 1.0 / (self.rrf_k + rank + 1)
-            sources.setdefault(r.chunk_id, "qdrant")
+            w = self.source_weights.get("qdrant_semantic", 1.0)
+            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
+            sources.setdefault(r.chunk_id, "qdrant_semantic")
+
+        for rank, r in enumerate(code_results):
+            w = self.source_weights.get("qdrant_code", 1.0)
+            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
+            sources.setdefault(r.chunk_id, "qdrant_code")
 
         for rank, r in enumerate(bm25_results):
-            scores[r.chunk_id] += 1.0 / (self.rrf_k + rank + 1)
+            w = self.source_weights.get("bm25", 0.7)
+            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
             sources.setdefault(r.chunk_id, "bm25")
 
         for rank, r in enumerate(fts_results):
-            scores[r.chunk_id] += 1.0 / (self.rrf_k + rank + 1)
+            w = self.source_weights.get("fts", 0.6)
+            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
             sources.setdefault(r.chunk_id, "fts")
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]

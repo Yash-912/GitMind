@@ -24,6 +24,22 @@ bm25s                       # pure-Python BM25 sparse index
 PyStemmer                   # stemmer backend for bm25s
 diskcache                   # persistent embedding cache
 
+# Phase 5 — Generation
+google-genai
+jinja2
+pydantic
+
+# Phase 6 — Evaluation
+ragas
+mlflow
+
+# Phase 7 — Interface
+streamlit
+typer
+
+# Optional — Reranker
+sentence-transformers
+
 # Dev / Testing
 pytest
 pytest-asyncio

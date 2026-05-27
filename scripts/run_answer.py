@@ -16,11 +16,18 @@ from retrieval import (
     QueryDecomposer,
     EntityResolver,
 )
+from generation import (
+    DirectQAGenerator,
+    DecisionMemoGenerator,
+    BlameMapGenerator,
+    RiskReportGenerator,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GitMind Phase 4 retrieval demo")
+    parser = argparse.ArgumentParser(description="GitMind end-to-end answer demo")
     parser.add_argument("query")
+    parser.add_argument("--mode", default="direct", choices=["direct", "memo", "blame", "risk"])
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--limit", type=int, default=40)
     parser.add_argument("--chunks-path", default=str(Path(settings.data_dir) / "chunks.jsonl"))
@@ -61,14 +68,30 @@ def main() -> None:
     assembler = ContextAssembler(max_tokens=3000)
     context = assembler.assemble(reranked)
 
-    print("\nTop chunks:")
-    for c in reranked:
-        doc_type = c.metadata.get("doc_type", "")
-        doc_id = c.metadata.get("doc_id", "")
-        print(f"- {doc_type}:{doc_id} score={c.score:.4f} source={c.source}")
+    if args.mode == "direct":
+        generator = DirectQAGenerator()
+        result = generator.generate(args.query, context)
+        answer = result.answer
+        model = result.model
+    elif args.mode == "memo":
+        generator = DecisionMemoGenerator()
+        result = generator.generate(args.query, context)
+        answer = result.raw_text
+        model = result.model
+    elif args.mode == "blame":
+        generator = BlameMapGenerator()
+        result = generator.generate(args.query, context)
+        answer = result.raw_text
+        model = result.model
+    else:
+        generator = RiskReportGenerator()
+        result = generator.generate(args.query, context)
+        answer = result.raw_text
+        model = result.model
 
-    print("\nContext preview:\n")
-    print(context)
+    print(f"Model: {model}")
+    print("\nAnswer:\n")
+    print(answer)
 
     expander.close()
     retriever.close()
@@ -76,6 +99,7 @@ def main() -> None:
     resolver.close()
     qdrant.close()
     fts.close()
+    generator.close()
 
 
 if __name__ == "__main__":

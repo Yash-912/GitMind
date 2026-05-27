@@ -33,6 +33,7 @@ from chunking import (
     PRChunker,
     IssueChunker,
     ChangelogChunker,
+    LogChunker,
     Chunk,
 )
 
@@ -67,6 +68,8 @@ def run_phase2() -> None:
         "pr": PRChunker(),
         "issue": IssueChunker(),
         "release": ChangelogChunker(),
+        "cicd": LogChunker("cicd"),
+        "pr_graphql": LogChunker("pr_graphql"),
     }
 
     all_chunks: list[Chunk] = []
@@ -146,6 +149,33 @@ def run_phase2() -> None:
     for payload in release_payloads:
         pr_rel = parser.parse_release(payload)
         chunks = chunkers["release"].chunk(pr_rel, repo=repo)
+        all_chunks.extend(chunks)
+
+    # ------------------------------------------------------------------ CI/CD Runs
+    print("\n[4b/5] Processing CI/CD runs...")
+    cicd_payloads = load_documents(store, "cicd")
+    print(f"  Found {len(cicd_payloads)} CI/CD documents")
+    for payload in cicd_payloads:
+        pc = parser.parse_cicd(payload)
+        entities = extractor.extract(pc.body_clean, doc_id=str(pc.run_id), doc_type="cicd")
+        for e in entities:
+            canonical = registry.resolve(e.text, e.label.lower())
+            registry.add_doc_reference(canonical, str(pc.run_id))
+        chunks = chunkers["cicd"].chunk(pc, repo=repo)
+        all_chunks.extend(chunks)
+
+    # ------------------------------------------------------------------ GraphQL PRs
+    print("\n[4c/5] Processing GraphQL PR records...")
+    gql_payloads = load_documents(store, "pr_graphql")
+    print(f"  Found {len(gql_payloads)} GraphQL PR documents")
+    for payload in gql_payloads:
+        pg = parser.parse_pr_graphql(payload)
+        text = pg.title + "\n" + pg.body_clean + "\n" + " ".join(pg.closing_issues)
+        entities = extractor.extract(text, doc_id=str(pg.number), doc_type="pr_graphql")
+        for e in entities:
+            canonical = registry.resolve(e.text, e.label.lower())
+            registry.add_doc_reference(canonical, str(pg.number))
+        chunks = chunkers["pr_graphql"].chunk(pg, repo=repo)
         all_chunks.extend(chunks)
 
     # ------------------------------------------------------------------ Temporal graph

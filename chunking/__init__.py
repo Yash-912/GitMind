@@ -5,6 +5,7 @@ from .diff_chunker import DiffChunker
 from .pr_chunker import PRChunker
 from .issue_chunker import IssueChunker
 from .changelog_chunker import ChangelogChunker
+from .log_chunker import LogChunker
 
 __all__ = [
     "ChunkMetadata",
@@ -15,4 +16,5 @@ __all__ = [
     "PRChunker",
     "IssueChunker",
     "ChangelogChunker",
+    "LogChunker",
 ]
