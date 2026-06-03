@@ -78,7 +78,11 @@ class FTSIndex:
                 (chunk_id, doc_type, doc_id, author, timestamp),
             )
 
-            # FTS5 table
+            # FTS5 table (delete first to avoid duplicates since FTS5 has no unique constraints)
+            self._conn.execute(
+                "DELETE FROM chunk_fts WHERE chunk_id = ?",
+                (chunk_id,),
+            )
             self._conn.execute(
                 """
                 INSERT INTO chunk_fts (chunk_id, doc_type, doc_id, text)
@@ -102,28 +106,36 @@ class FTSIndex:
         doc_type: str | None = None,
     ) -> list[FTSResult]:
         """Full-text search over chunk content. Returns ranked results."""
-        if doc_type:
-            rows = self._conn.execute(
-                """
-                SELECT chunk_id, doc_type, doc_id, rank
-                FROM chunk_fts
-                WHERE chunk_fts MATCH ? AND doc_type = ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (query, doc_type, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """
-                SELECT chunk_id, doc_type, doc_id, rank
-                FROM chunk_fts
-                WHERE chunk_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (query, limit),
-            ).fetchall()
+        import re
+        clean_query = re.sub(r"[^\w\s]", " ", query).strip()
+        if not clean_query:
+            return []
+
+        try:
+            if doc_type:
+                rows = self._conn.execute(
+                    """
+                    SELECT chunk_id, doc_type, doc_id, rank
+                    FROM chunk_fts
+                    WHERE chunk_fts MATCH ? AND doc_type = ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (clean_query, doc_type, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT chunk_id, doc_type, doc_id, rank
+                    FROM chunk_fts
+                    WHERE chunk_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (clean_query, limit),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return []
 
         return [
             FTSResult(

@@ -34,6 +34,11 @@ class BM25Index:
 
     def build(self, chunk_ids: list[str], texts: list[str]) -> None:
         """Build the BM25 index from scratch over the given corpus."""
+        if not chunk_ids or not texts:
+            self._ids = []
+            self._texts = []
+            self._index = None
+            return
         import bm25s  # type: ignore
 
         self._ids = list(chunk_ids)
@@ -63,7 +68,7 @@ class BM25Index:
 
     def search(self, query: str, limit: int = 40) -> list[BM25Result]:
         """Search the index and return ranked results."""
-        if self._index is None:
+        if self._index is None or not self._ids:
             return []
 
         import bm25s  # type: ignore

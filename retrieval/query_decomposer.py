@@ -68,7 +68,7 @@ class QueryDecomposer:
                 intent=plan.intent or "general",
                 sub_queries=sub_queries,
             )
-        except (ValidationError, json.JSONDecodeError, TypeError):
+        except Exception:
             return None
 
     def close(self) -> None:

@@ -36,6 +36,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    import sys
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except AttributeError:
+            pass
     args = parse_args()
 
     chunk_store = ChunkStore(args.chunks_path)

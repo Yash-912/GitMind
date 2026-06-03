@@ -29,8 +29,8 @@ class EntityRegistry:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._setup_tables()
         self._cache: dict[str, EntityRecord] = {}  # canonical_name → EntityRecord
+        self._setup_tables()
 
     # ------------------------------------------------------------------
     # Setup
@@ -146,10 +146,17 @@ class EntityRegistry:
 
     def search(self, query: str, limit: int = 10) -> list[EntityRecord]:
         """FTS5-backed prefix search over entity names and aliases."""
-        rows = self._conn.execute(
-            "SELECT entity_name FROM entity_index WHERE entity_index MATCH ? LIMIT ?",
-            (query + "*", limit),
-        ).fetchall()
+        import re
+        clean_query = re.sub(r"[^\w\s]", " ", query).strip()
+        if not clean_query:
+            return []
+        try:
+            rows = self._conn.execute(
+                "SELECT entity_name FROM entity_index WHERE entity_index MATCH ? LIMIT ?",
+                (clean_query + "*", limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
         results: list[EntityRecord] = []
         for row in rows:
             record = self._cache.get(row[0])

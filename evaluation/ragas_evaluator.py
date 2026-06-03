@@ -33,6 +33,7 @@ class RagasEvaluator:
         self._ragas = None
         try:
             import ragas  # type: ignore
+            from datasets import Dataset  # type: ignore
             from ragas.metrics import (
                 faithfulness,
                 answer_relevancy,
@@ -42,6 +43,7 @@ class RagasEvaluator:
 
             self._ragas = {
                 "ragas": ragas,
+                "dataset_class": Dataset,
                 "metrics": [faithfulness, answer_relevancy, context_precision, context_recall],
             }
         except Exception:
@@ -55,6 +57,7 @@ class RagasEvaluator:
         results, meta = self._run_pipeline(pairs)
 
         ragas = self._ragas["ragas"]
+        dataset_class = self._ragas["dataset_class"]
         metrics = self._ragas["metrics"]
         data = {
             "question": [r.question for r in results],
@@ -62,7 +65,7 @@ class RagasEvaluator:
             "contexts": [[r.context] for r in results],
             "ground_truth": [r.ground_truth for r in results],
         }
-        dataset = ragas.Dataset.from_dict(data)
+        dataset = dataset_class.from_dict(data)
         scores = ragas.evaluate(dataset, metrics=metrics)
         custom = self._compute_custom_metrics(meta)
         merged = dict(scores)

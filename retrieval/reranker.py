@@ -46,7 +46,7 @@ class CrossEncoderReranker:
             if key in self._cache:
                 scores.append(self._cache[key])
             else:
-                scores.append(float("nan"))
+                scores.append(None)
                 missing_pairs.append(key)
                 missing_texts.append((query, c.text))
 
@@ -57,7 +57,7 @@ class CrossEncoderReranker:
 
             # Fill scores list
             it = iter(new_scores)
-            scores = [s if s == s else float(next(it)) for s in scores]
+            scores = [s if s is not None else float(next(it)) for s in scores]
 
         return scores
 

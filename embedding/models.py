@@ -52,14 +52,14 @@ class OllamaEmbeddingClient:
         if not text:
             return [0.0] * PROSE_DIM
 
-        resp = self._client.post(
-            f"{self.base_url}/api/embeddings",
-            json={"model": model, "prompt": text},
-        )
         try:
+            resp = self._client.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": model, "prompt": text},
+            )
             resp.raise_for_status()
             return resp.json()["embedding"]
-        except httpx.HTTPStatusError as e:
+        except Exception as e:
             print(f"  [!] Warning: Failed to embed chunk (len={len(text)}). Returning zero vector. {e}")
             return [0.0] * PROSE_DIM
 
@@ -83,7 +83,7 @@ class OllamaEmbeddingClient:
             batch = texts[start : start + batch_size]
             try:
                 vectors = self._embed_batch_api(batch, model)
-            except (httpx.HTTPStatusError, KeyError, httpx.RequestError) as e:
+            except Exception as e:
                 # Fallback: sequential single calls
                 vectors = [self.embed_single(t, model) for t in batch]
             all_vectors.extend(vectors)
