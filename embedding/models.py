@@ -81,11 +81,11 @@ class OllamaEmbeddingClient:
             for attempt in range(5):
                 try:
                     resp = self._gemini.models.embed_content(
-                        model="gemini-embedding-2",
+                        model="text-embedding-004",
                         contents=text,
                     )
                     if resp.embeddings and len(resp.embeddings) > 0:
-                        return resp.embeddings[0].values
+                        return resp.embeddings[0].values[:PROSE_DIM]
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
@@ -143,10 +143,10 @@ class OllamaEmbeddingClient:
             for attempt in range(5):
                 try:
                     resp = self._gemini.models.embed_content(
-                        model="gemini-embedding-2",
+                        model="text-embedding-004",
                         contents=texts,
                     )
-                    return [e.values for e in resp.embeddings]
+                    return [e.values[:PROSE_DIM] for e in resp.embeddings]
                 except Exception as e:
                     err_str = str(e)
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
