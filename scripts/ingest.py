@@ -25,6 +25,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.github_repo:
+        repo_input = args.github_repo.strip()
+        if repo_input.endswith(".git"):
+            repo_input = repo_input[:-4]
+        if "github.com/" in repo_input:
+            repo_input = repo_input.split("github.com/")[-1]
+        elif "github.com:" in repo_input:
+            repo_input = repo_input.split("github.com:")[-1]
+        repo_input = repo_input.strip("/")
+        parts = repo_input.split("/")
+        if len(parts) >= 2:
+            args.github_repo = f"{parts[-2]}/{parts[-1]}"
+        else:
+            args.github_repo = repo_input
+
     db_path = Path(args.db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
