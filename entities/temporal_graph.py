@@ -41,13 +41,19 @@ def _get_connection(db_path: str):
     an in-process SQLite file so that graph_edges traversal stays fast.
     """
     from config.settings import settings
+    import os
+    import sqlite3
+
     if settings.database_url and not settings.database_url.startswith("sqlite"):
-        # Use a dedicated local file for the graph even when Postgres is the
-        # main store – avoids having to port the adjacency-list queries.
-        import os
-        os.makedirs("data", exist_ok=True)
-        return sqlite3.connect("data/graph.db", check_same_thread=False)
-    return sqlite3.connect(db_path, check_same_thread=False)
+        path = "data/graph.db"
+    else:
+        path = db_path
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path, timeout=60.0, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
 
 
 class TemporalGraphBuilder:

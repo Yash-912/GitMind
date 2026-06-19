@@ -27,14 +27,19 @@ def _get_connection(db_path: str):
     while the structured data lives in Postgres.
     """
     from config.settings import settings
-    if settings.database_url and not settings.database_url.startswith("sqlite"):
-        # Production with Postgres: use a local SQLite file for FTS5
-        import os
-        import sqlite3
-        os.makedirs("data", exist_ok=True)
-        return sqlite3.connect("data/entities.db", check_same_thread=False)
+    import os
     import sqlite3
-    return sqlite3.connect(db_path, check_same_thread=False)
+
+    if settings.database_url and not settings.database_url.startswith("sqlite"):
+        path = "data/entities.db"
+    else:
+        path = db_path
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path, timeout=60.0, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
 
 
 class EntityRegistry:

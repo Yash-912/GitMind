@@ -23,7 +23,9 @@ class FTSIndex:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, timeout=60.0, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._setup()
 
     def _setup(self) -> None:
