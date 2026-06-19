@@ -119,6 +119,7 @@ def query(req: QueryRequest, _: None = Security(_verify_key)):
     → reranking → LLM generation.
     """
     from retrieval import (
+        ChunkStore,
         HybridRetriever,
         GraphExpander,
         CrossEncoderReranker,
