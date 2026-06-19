@@ -6,7 +6,7 @@ colorTo: purple
 sdk: docker
 app_port: 7860
 pinned: false
-short_description: Ask "why" questions about any codebase history using RAG + temporal graphs
+short_description: Ask "why" questions about codebase history using RAG
 ---
 
 # GitMind
