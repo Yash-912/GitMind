@@ -29,6 +29,43 @@ def main() -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     store = DocumentStore(str(db_path))
+    repo_path = Path(args.repo_path)
+    is_git_repo = False
+    try:
+        from git import Repo
+        Repo(str(repo_path))
+        is_git_repo = True
+    except Exception:
+        pass
+
+    if not is_git_repo:
+        if args.github_repo:
+            print(f"[git] '{repo_path}' is not a valid git repository.")
+            clone_dir = Path("data/repos") / args.github_repo.replace("/", "_")
+            if clone_dir.exists() and (clone_dir / ".git").exists():
+                print(f"[git] Found existing cloned repo at {clone_dir}. Reusing it.")
+            else:
+                print(f"[git] Cloning {args.github_repo} into {clone_dir}...")
+                clone_dir.mkdir(parents=True, exist_ok=True)
+                import subprocess
+                if args.github_token:
+                    clone_url = f"https://{args.github_token}@github.com/{args.github_repo}.git"
+                else:
+                    clone_url = f"https://github.com/{args.github_repo}.git"
+                
+                cmd = ["git", "clone", clone_url, str(clone_dir)]
+                if args.max_commits and args.max_commits < 100:
+                    cmd += ["--depth", str(args.max_commits)]
+                try:
+                    subprocess.run(cmd, check=True)
+                except subprocess.CalledProcessError as err:
+                    print(f"Error cloning repository: {err}")
+                    sys.exit(1)
+            args.repo_path = str(clone_dir)
+        else:
+            print(f"Error: '{repo_path}' is not a valid git repository, and no --github-repo was specified.")
+            sys.exit(1)
+
     git_collector = GitCollector(args.repo_path)
     print("[git] collecting commits...")
     commits = git_collector.collect_commits(max_count=args.max_commits)
