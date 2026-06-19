@@ -30,8 +30,8 @@ def _make_engine(db_path: str | None = None):
 
     connect_args: dict = {}
     if url.startswith("sqlite"):
-        # Enable WAL mode to allow concurrent readers during writes.
-        connect_args = {"check_same_thread": False}
+        # Enable WAL mode and set timeout to allow concurrent readers during writes.
+        connect_args = {"check_same_thread": False, "timeout": 60.0}
 
     engine = create_engine(url, connect_args=connect_args)
 

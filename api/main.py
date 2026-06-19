@@ -138,6 +138,9 @@ def query(req: QueryRequest, _: None = Security(_verify_key)):
     bm25 = _state["bm25"]
     fts = _state["fts"]
 
+    # Reload ChunkStore in case ingestion ran after server startup.
+    fresh_chunk_store = ChunkStore(_state["chunks_path"])
+
     # --- Query decomposition & entity resolution ---
     decomposer = QueryDecomposer()
     plan = decomposer.decompose(req.query)
@@ -148,7 +151,7 @@ def query(req: QueryRequest, _: None = Security(_verify_key)):
     resolver.close()
 
     # --- Retrieval ---
-    retriever = HybridRetriever(qdrant=qdrant, bm25=bm25, fts=fts, chunk_store=chunk_store)
+    retriever = HybridRetriever(qdrant=qdrant, bm25=bm25, fts=fts, chunk_store=fresh_chunk_store)
     candidates = retriever.retrieve(
         req.query,
         limit=req.limit,
@@ -159,7 +162,7 @@ def query(req: QueryRequest, _: None = Security(_verify_key)):
         },
     )
 
-    expander = GraphExpander(db_path=settings.db_path, chunk_store=chunk_store, hop_depth=1)
+    expander = GraphExpander(db_path=settings.db_path, chunk_store=fresh_chunk_store, hop_depth=1)
     expanded = expander.expand(candidates)
     expander.close()
 
@@ -230,27 +233,32 @@ def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Secu
 
     def _run_ingest():
         import subprocess, sys
+        from pathlib import Path as _Path
         _tasks[task_id] = "running"
-        
+
+        # Resolve project root from this file's location so the CWD is
+        # always correct regardless of Docker entrypoint directory.
+        project_root = str(_Path(__file__).resolve().parent.parent)
+
         cmd_p1 = [sys.executable, "scripts/ingest.py", "--repo-path", req.repo_path]
         if req.github_repo:
             cmd_p1 += ["--github-repo", req.github_repo]
         if req.max_commits:
             cmd_p1 += ["--max-commits", str(req.max_commits)]
-            
+
         try:
             # Phase 1: Data ingestion
             print(f"==> Starting Phase 1 ingestion for {req.github_repo or req.repo_path}...")
-            subprocess.run(cmd_p1, check=True)
-            
+            subprocess.run(cmd_p1, check=True, cwd=project_root)
+
             # Phase 2: Parsing & chunking
             print("==> Starting Phase 2 parsing and chunking...")
-            subprocess.run([sys.executable, "scripts/run_phase2.py"], check=True)
-            
+            subprocess.run([sys.executable, "scripts/run_phase2.py"], check=True, cwd=project_root)
+
             # Phase 3: Embedding & indexing
             print("==> Starting Phase 3 embedding and indexing...")
-            subprocess.run([sys.executable, "scripts/run_phase3.py"], check=True)
-            
+            subprocess.run([sys.executable, "scripts/run_phase3.py"], check=True, cwd=project_root)
+
             _tasks[task_id] = "done"
         except subprocess.CalledProcessError as exc:
             _tasks[task_id] = f"error in command: {exc}"

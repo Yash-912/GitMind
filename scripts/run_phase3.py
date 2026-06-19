@@ -52,23 +52,17 @@ def run_phase3() -> None:
     chunks = load_chunks(str(chunks_path))
     print(f"  Loaded {len(chunks)} chunks")
 
-    # ---- Check Ollama readiness ----
-    print("\n[2/5] Checking Ollama...")
+    # ---- Check embedding readiness (Ollama or Gemini fallback) ----
+    print("\n[2/5] Checking embedding provider...")
     client = OllamaEmbeddingClient()
     if not client.is_available():
-        print("  ❌ Ollama is not running! Start it with: ollama serve")
-        print("  Then pull models:")
-        print(f"    ollama pull {PROSE_MODEL}")
-        print(f"    ollama pull {CODE_MODEL}")
-        sys.exit(1)
-
-    prose_ok = client.has_model(PROSE_MODEL)
-    code_ok = client.has_model(CODE_MODEL)
-    print(f"  {PROSE_MODEL}: {'✅' if prose_ok else '❌ (run: ollama pull ' + PROSE_MODEL + ')'}")
-    print(f"  {CODE_MODEL}: {'✅' if code_ok else '❌ (run: ollama pull ' + CODE_MODEL + ')'}")
-    if not (prose_ok and code_ok):
-        print("  Pull missing models and re-run.")
-        sys.exit(1)
+        print("  ⚠️  Ollama is not running. Gemini fallback will be used if GEMINI_API_KEY is set.")
+        # Do NOT exit — OllamaEmbeddingClient already falls back to Gemini.
+    else:
+        prose_ok = client.has_model(PROSE_MODEL)
+        code_ok = client.has_model(CODE_MODEL)
+        print(f"  {PROSE_MODEL}: {'✅' if prose_ok else '⚠️  model not found, Gemini fallback active'}")
+        print(f"  {CODE_MODEL}: {'✅' if code_ok else '⚠️  model not found, Gemini fallback active'}")
 
     # ---- Embed ----
     print("\n[3/5] Embedding chunks...")
@@ -81,13 +75,13 @@ def run_phase3() -> None:
 
     # ---- Qdrant upsert ----
     print("\n[4/5] Upserting into Qdrant...")
-    qdrant = QdrantStore(path=str(data_dir / ".qdrant"))
+    qdrant = QdrantStore(path=settings.qdrant_path)
     upserted = qdrant.upsert_embedded_chunks(embedded)
     print(f"  Qdrant points: {qdrant.count()}")
 
     # ---- BM25 index ----
     print("\n[5a/5] Building BM25 index...")
-    bm25 = BM25Index(index_dir=str(data_dir / "bm25_index"))
+    bm25 = BM25Index(index_dir=settings.bm25_index_dir)
     chunk_ids = [c["metadata"]["chunk_id"] for c in chunks]
     chunk_texts = [c["text"] for c in chunks]
     bm25.build(chunk_ids, chunk_texts)

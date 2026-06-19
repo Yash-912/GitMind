@@ -37,27 +37,28 @@ class CrossEncoderReranker:
         return [c for c, _ in scored[:top_k]]
 
     def _score_with_cache(self, query: str, items: list[CandidateChunk]) -> list[float]:
-        missing_pairs: list[tuple[str, str]] = []
+        missing_indices: list[int] = []
         missing_texts: list[tuple[str, str]] = []
-        scores: list[float] = []
+        scores: list[float] = [0.0] * len(items)
 
-        for c in items:
+        # First pass: populate from cache, record misses
+        for i, c in enumerate(items):
             key = (query, c.chunk_id)
             if key in self._cache:
-                scores.append(self._cache[key])
+                scores[i] = self._cache[key]
             else:
-                scores.append(None)
-                missing_pairs.append(key)
+                missing_indices.append(i)
                 missing_texts.append((query, c.text))
 
+        # Batch-score all misses
         if missing_texts:
-            new_scores = self._model.predict(missing_texts)
-            for key, score in zip(missing_pairs, new_scores):
-                self._set_cache(key, float(score))
-
-            # Fill scores list
-            it = iter(new_scores)
-            scores = [s if s is not None else float(next(it)) for s in scores]
+            new_scores = list(self._model.predict(missing_texts))
+            for list_idx, item_idx in enumerate(missing_indices):
+                c = items[item_idx]
+                key = (query, c.chunk_id)
+                score = float(new_scores[list_idx])
+                self._set_cache(key, score)
+                scores[item_idx] = score
 
         return scores
 

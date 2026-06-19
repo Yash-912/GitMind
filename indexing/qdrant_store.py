@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import uuid
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -29,6 +30,16 @@ class SearchResult:
     chunk_id: str
     score: float
     payload: dict
+
+
+def _chunk_id_to_uuid(chunk_id: str) -> str:
+    """Convert an arbitrary string chunk_id to a deterministic UUID5.
+
+    Qdrant requires point IDs to be UUIDs or unsigned ints, not arbitrary
+    strings.  We derive a stable UUID from the chunk_id so that re-ingestion
+    is idempotent.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id))
 
 
 class QdrantStore:
@@ -122,10 +133,15 @@ class QdrantStore:
 
             payload = dict(ec.metadata) if ec.metadata else {}
             payload["text"] = ec.text
+            # Always store the original string chunk_id in the payload
+            payload["chunk_id"] = ec.chunk_id
+
+            # Qdrant only accepts UUID or unsigned-int point IDs.
+            point_uuid = _chunk_id_to_uuid(ec.chunk_id)
 
             points.append(
                 PointStruct(
-                    id=ec.chunk_id,
+                    id=point_uuid,
                     vector=vectors,
                     payload=payload,
                 )
@@ -162,7 +178,8 @@ class QdrantStore:
         ).points
         return [
             SearchResult(
-                chunk_id=str(r.id),
+                # Prefer original string chunk_id stored in payload; fall back to UUID str.
+                chunk_id=str(r.payload.get("chunk_id", r.id)) if r.payload else str(r.id),
                 score=r.score,
                 payload=r.payload or {},
             )
@@ -185,7 +202,7 @@ class QdrantStore:
         ).points
         return [
             SearchResult(
-                chunk_id=str(r.id),
+                chunk_id=str(r.payload.get("chunk_id", r.id)) if r.payload else str(r.id),
                 score=r.score,
                 payload=r.payload or {},
             )
