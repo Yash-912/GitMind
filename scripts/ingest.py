@@ -67,12 +67,24 @@ def main() -> None:
                     clone_url = f"https://{args.github_token}@github.com/{args.github_repo}.git"
                 else:
                     clone_url = f"https://github.com/{args.github_repo}.git"
-                
-                cmd = ["git", "clone", clone_url, str(clone_dir)]
-                if args.max_commits and args.max_commits < 100:
-                    cmd += ["--depth", str(args.max_commits)]
+
+                # Always do a shallow clone: use max_commits if given, else cap at 500.
+                # This prevents multi-GB full-history clones from hanging the pipeline.
+                depth = args.max_commits if (args.max_commits and args.max_commits > 0) else 500
+                cmd = [
+                    "git", "clone",
+                    "--depth", str(depth),
+                    "--single-branch",   # only default branch — skips all other branches
+                    "--no-tags",         # skip tag objects to further reduce size
+                    clone_url,
+                    str(clone_dir),
+                ]
                 try:
-                    subprocess.run(cmd, check=True)
+                    # 10-minute hard timeout — if clone hangs, fail fast
+                    subprocess.run(cmd, check=True, timeout=600)
+                except subprocess.TimeoutExpired:
+                    print(f"Error: git clone timed out after 10 minutes.")
+                    sys.exit(1)
                 except subprocess.CalledProcessError as err:
                     print(f"Error cloning repository: {err}")
                     sys.exit(1)
