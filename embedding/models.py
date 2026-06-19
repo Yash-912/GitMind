@@ -77,15 +77,25 @@ class OllamaEmbeddingClient:
 
         # 2. Try Gemini fallback
         if self._gemini is not None:
-            try:
-                resp = self._gemini.models.embed_content(
-                    model="gemini-embedding-2",
-                    contents=text,
-                )
-                if resp.embeddings and len(resp.embeddings) > 0:
-                    return resp.embeddings[0].values
-            except Exception as e:
-                print(f"  [!] Warning: Gemini single embedding fallback failed: {e}")
+            import time
+            for attempt in range(5):
+                try:
+                    resp = self._gemini.models.embed_content(
+                        model="gemini-embedding-2",
+                        contents=text,
+                    )
+                    if resp.embeddings and len(resp.embeddings) > 0:
+                        return resp.embeddings[0].values
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                        if attempt < 4:
+                            sleep_time = (2 ** attempt) * 5
+                            print(f"  [!] Gemini rate limited (429). Retrying single in {sleep_time}s...")
+                            time.sleep(sleep_time)
+                            continue
+                    print(f"  [!] Warning: Gemini single embedding fallback failed: {e}")
+                    break
 
         print(f"  [!] Warning: Failed to embed chunk. Returning zero vector.")
         return [0.0] * PROSE_DIM
@@ -129,15 +139,24 @@ class OllamaEmbeddingClient:
 
         # 2. Try Gemini fallback
         if self._gemini is not None:
-            try:
-                resp = self._gemini.models.embed_content(
-                    model="gemini-embedding-2",
-                    contents=texts,
-                )
-                return [e.values for e in resp.embeddings]
-            except Exception as e:
-                print(f"  [!] Warning: Gemini batch embedding fallback failed: {e}")
-                raise
+            import time
+            for attempt in range(5):
+                try:
+                    resp = self._gemini.models.embed_content(
+                        model="gemini-embedding-2",
+                        contents=texts,
+                    )
+                    return [e.values for e in resp.embeddings]
+                except Exception as e:
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                        if attempt < 4:
+                            sleep_time = (2 ** attempt) * 5  # 5, 10, 20, 40
+                            print(f"  [!] Gemini rate limited (429). Retrying batch in {sleep_time}s...")
+                            time.sleep(sleep_time)
+                            continue
+                    print(f"  [!] Warning: Gemini batch embedding fallback failed: {e}")
+                    raise
 
         raise RuntimeError("No embedding provider available.")
 
