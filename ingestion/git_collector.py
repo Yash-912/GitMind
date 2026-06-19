@@ -53,12 +53,25 @@ class GitCollector:
             if max_count is not None and count >= max_count:
                 break
 
-            parent = commit.parents[0] if commit.parents else None
-            diffs = commit.diff(parent, create_patch=True)
+            try:
+                parent = commit.parents[0] if commit.parents else None
+                diffs = commit.diff(parent, create_patch=True)
+                stats_obj = commit.stats
+                stats_total = {
+                    "files": int(stats_obj.total.get("files", 0)),
+                    "insertions": int(stats_obj.total.get("insertions", 0)),
+                    "deletions": int(stats_obj.total.get("deletions", 0)),
+                }
+                file_stats = stats_obj.files
+            except Exception as exc:
+                # Handle shallow clone boundary where parent commit is missing, or other git command failures
+                print(f"[git] Warning: could not get diff/stats for commit {commit.hexsha} (likely shallow clone boundary): {exc}")
+                diffs = []
+                stats_total = {"files": 0, "insertions": 0, "deletions": 0}
+                file_stats = {}
+
             diff_text = "".join(d.diff.decode("utf-8", errors="replace") for d in diffs)
             file_paths = [d.b_path or d.a_path or "" for d in diffs]
-            stats = commit.stats
-            file_stats = stats.files
 
             file_changes: list[FileChange] = []
             for d in diffs:
@@ -78,20 +91,19 @@ class GitCollector:
                     )
                 )
 
+            author_name = commit.author.name if commit.author else ""
+            author_email = commit.author.email if commit.author else ""
+
             record = CommitRecord(
                 sha=commit.hexsha,
-                author_name=commit.author.name,
-                author_email=commit.author.email,
+                author_name=author_name or "",
+                author_email=author_email or "",
                 authored_at=_isoformat(commit.authored_datetime),
                 message=commit.message.strip(),
                 file_paths=[p for p in file_paths if p],
                 diff_text=diff_text,
                 file_changes=[fc.__dict__ for fc in file_changes],
-                stats={
-                    "files": int(stats.total.get("files", 0)),
-                    "insertions": int(stats.total.get("insertions", 0)),
-                    "deletions": int(stats.total.get("deletions", 0)),
-                },
+                stats=stats_total,
             )
             yield record
             count += 1
