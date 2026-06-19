@@ -19,7 +19,7 @@ class LLMClient:
 
     def __init__(
         self,
-        gemini_model: str = "gemini-1.5-flash",
+        gemini_model: str = "gemini-2.5-flash",
         ollama_model: str = "qwen2.5:1.5b",
         ollama_base_url: str | None = None,
         timeout: float = 120.0,

@@ -31,7 +31,7 @@ class OllamaEmbeddingClient:
     Supports both single-text and batch embedding via the /api/embed
     endpoint (Ollama ≥ 0.4.0).
 
-    Falls back to the Google Gemini API (text-embedding-004) if Ollama is not
+    Falls back to the Google Gemini API (gemini-embedding-2) if Ollama is not
     running/available but GEMINI_API_KEY is configured.
     """
 
@@ -79,7 +79,7 @@ class OllamaEmbeddingClient:
         if self._gemini is not None:
             try:
                 resp = self._gemini.models.embed_content(
-                    model="text-embedding-004",
+                    model="gemini-embedding-2",
                     contents=text,
                 )
                 if resp.embeddings and len(resp.embeddings) > 0:
@@ -131,7 +131,7 @@ class OllamaEmbeddingClient:
         if self._gemini is not None:
             try:
                 resp = self._gemini.models.embed_content(
-                    model="text-embedding-004",
+                    model="gemini-embedding-2",
                     contents=texts,
                 )
                 return [e.values for e in resp.embeddings]
