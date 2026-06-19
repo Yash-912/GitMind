@@ -241,7 +241,7 @@ def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Secu
         # always correct regardless of Docker entrypoint directory.
         project_root = str(_Path(__file__).resolve().parent.parent)
 
-        cmd_p1 = [sys.executable, "scripts/ingest.py", "--repo-path", req.repo_path]
+        cmd_p1 = [sys.executable, "-u", "scripts/ingest.py", "--repo-path", req.repo_path]
         if req.github_repo:
             cmd_p1 += ["--github-repo", req.github_repo]
         if req.max_commits:
@@ -254,11 +254,11 @@ def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Secu
 
             # Phase 2: Parsing & chunking
             print("==> Starting Phase 2 parsing and chunking...")
-            subprocess.run([sys.executable, "scripts/run_phase2.py"], check=True, cwd=project_root)
+            subprocess.run([sys.executable, "-u", "scripts/run_phase2.py"], check=True, cwd=project_root)
 
             # Phase 3: Embedding & indexing
             print("==> Starting Phase 3 embedding and indexing...")
-            subprocess.run([sys.executable, "scripts/run_phase3.py"], check=True, cwd=project_root)
+            subprocess.run([sys.executable, "-u", "scripts/run_phase3.py"], check=True, cwd=project_root)
 
             _tasks[task_id] = "done"
         except subprocess.CalledProcessError as exc:
