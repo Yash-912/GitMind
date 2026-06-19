@@ -16,7 +16,7 @@ client = genai.Client(api_key=api_key)
 
 # Send prompt
 response = client.models.generate_content(
-    model="gemini-2.5-flash",
+    model="gemini-2.0-flash",
     contents="Explain AST parsing in simple terms."
 )
 
