@@ -19,7 +19,7 @@ class LLMClient:
 
     def __init__(
         self,
-        gemini_model: str = "gemini-2.0-flash",
+        gemini_model: str = "gemini-2.5-flash",
         ollama_model: str = "qwen2.5:1.5b",
         ollama_base_url: str | None = None,
         timeout: float = 120.0,
@@ -43,29 +43,24 @@ class LLMClient:
 
     def generate(self, prompt: str) -> LLMResponse:
         if self._gemini is not None:
-            # Try primary gemini model
-            try:
-                resp = self._gemini.models.generate_content(
-                    model=self.gemini_model,
-                    contents=prompt,
-                )
-                return LLMResponse(text=resp.text or "", model=self.gemini_model)
-            except Exception as e:
-                print(f"  [!] Warning: Gemini {self.gemini_model} generation failed. {e}")
-                pass
-            
-            # Try fallback to gemini-1.5-flash if 2.0 fails (e.g. 404)
-            fallback_model = "gemini-1.5-flash"
-            if self.gemini_model != fallback_model:
+            import time
+            for attempt in range(5):
                 try:
                     resp = self._gemini.models.generate_content(
-                        model=fallback_model,
+                        model=self.gemini_model,
                         contents=prompt,
                     )
-                    return LLMResponse(text=resp.text or "", model=fallback_model)
+                    return LLMResponse(text=resp.text or "", model=self.gemini_model)
                 except Exception as e:
-                    print(f"  [!] Warning: Gemini {fallback_model} generation failed. {e}")
-                    pass
+                    err_str = str(e)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                        if attempt < 4:
+                            sleep_time = (2 ** attempt) * 5
+                            print(f"  [!] Gemini generation rate limited (429). Retrying in {sleep_time}s...")
+                            time.sleep(sleep_time)
+                            continue
+                    print(f"  [!] Warning: Gemini {self.gemini_model} generation failed. {e}")
+                    break
 
         try:
             print(f"  [!] Falling back to local Ollama model: {self.ollama_model}...")

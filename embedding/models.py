@@ -81,7 +81,7 @@ class OllamaEmbeddingClient:
             for attempt in range(5):
                 try:
                     resp = self._gemini.models.embed_content(
-                        model="text-embedding-004",
+                        model="gemini-embedding-2",
                         contents=text,
                     )
                     if resp.embeddings and len(resp.embeddings) > 0:
@@ -143,7 +143,7 @@ class OllamaEmbeddingClient:
             for attempt in range(5):
                 try:
                     resp = self._gemini.models.embed_content(
-                        model="text-embedding-004",
+                        model="gemini-embedding-2",
                         contents=texts,
                     )
                     return [e.values[:PROSE_DIM] for e in resp.embeddings]
