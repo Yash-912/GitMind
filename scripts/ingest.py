@@ -62,31 +62,52 @@ def main() -> None:
             else:
                 print(f"[git] Cloning {args.github_repo} into {clone_dir}...")
                 clone_dir.mkdir(parents=True, exist_ok=True)
+                import os
                 import subprocess
-                if args.github_token:
-                    clone_url = f"https://{args.github_token}@github.com/{args.github_repo}.git"
-                else:
-                    clone_url = f"https://github.com/{args.github_repo}.git"
+                import shutil
+                
+                env = os.environ.copy()
+                env["GIT_TERMINAL_PROMPT"] = "0"
 
                 # Always do a shallow clone: use max_commits if given, else cap at 500.
-                # This prevents multi-GB full-history clones from hanging the pipeline.
                 depth = args.max_commits if (args.max_commits and args.max_commits > 0) else 500
-                cmd = [
-                    "git", "clone",
-                    "--depth", str(depth),
-                    "--single-branch",   # only default branch — skips all other branches
-                    "--no-tags",         # skip tag objects to further reduce size
-                    clone_url,
-                    str(clone_dir),
-                ]
-                try:
-                    # 10-minute hard timeout — if clone hangs, fail fast
-                    subprocess.run(cmd, check=True, timeout=600)
-                except subprocess.TimeoutExpired:
-                    print(f"Error: git clone timed out after 10 minutes.")
-                    sys.exit(1)
-                except subprocess.CalledProcessError as err:
-                    print(f"Error cloning repository: {err}")
+                
+                def _run_clone(url: str) -> bool:
+                    cmd = [
+                        "git", "clone",
+                        "--depth", str(depth),
+                        "--single-branch",
+                        "--no-tags",
+                        url,
+                        str(clone_dir),
+                    ]
+                    try:
+                        subprocess.run(cmd, check=True, timeout=600, env=env)
+                        return True
+                    except subprocess.TimeoutExpired:
+                        print(f"Error: git clone timed out after 10 minutes.")
+                        return False
+                    except subprocess.CalledProcessError as err:
+                        safe_url = url.replace(args.github_token, "***") if args.github_token else url
+                        print(f"Warning: git clone failed with URL {safe_url}: {err}")
+                        if clone_dir.exists():
+                            shutil.rmtree(clone_dir, ignore_errors=True)
+                        return False
+
+                success = False
+                if args.github_token:
+                    # Try with token first (for private repos)
+                    token_url = f"https://{args.github_token}@github.com/{args.github_repo}.git"
+                    success = _run_clone(token_url)
+                
+                if not success:
+                    # Fallback to public URL (if token was invalid/expired, or no token provided)
+                    public_url = f"https://github.com/{args.github_repo}.git"
+                    print(f"[git] Attempting clone via public URL: {public_url}")
+                    success = _run_clone(public_url)
+                
+                if not success:
+                    print(f"Error: Failed to clone repository {args.github_repo}.")
                     sys.exit(1)
             args.repo_path = str(clone_dir)
         else:
