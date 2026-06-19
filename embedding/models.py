@@ -29,8 +29,10 @@ class OllamaEmbeddingClient:
     """Synchronous client for Ollama's embedding API.
 
     Supports both single-text and batch embedding via the /api/embed
-    endpoint (Ollama ≥ 0.4.0).  Falls back to the older /api/embeddings
-    single-text endpoint when batch fails.
+    endpoint (Ollama ≥ 0.4.0).
+
+    Falls back to the Google Gemini API (text-embedding-004) if Ollama is not
+    running/available but GEMINI_API_KEY is configured.
     """
 
     def __init__(
@@ -42,6 +44,16 @@ class OllamaEmbeddingClient:
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
 
+        # Initialize Gemini client if API key is provided for fallback
+        self._gemini = None
+        from config.settings import settings
+        if settings.gemini_api_key:
+            try:
+                from google import genai
+                self._gemini = genai.Client(api_key=settings.gemini_api_key)
+            except Exception:
+                self._gemini = None
+
     # ------------------------------------------------------------------
     # Single text
     # ------------------------------------------------------------------
@@ -52,16 +64,31 @@ class OllamaEmbeddingClient:
         if not text:
             return [0.0] * PROSE_DIM
 
+        # 1. Try local Ollama
         try:
             resp = self._client.post(
                 f"{self.base_url}/api/embeddings",
                 json={"model": model, "prompt": text},
             )
-            resp.raise_for_status()
-            return resp.json()["embedding"]
-        except Exception as e:
-            print(f"  [!] Warning: Failed to embed chunk (len={len(text)}). Returning zero vector. {e}")
-            return [0.0] * PROSE_DIM
+            if resp.status_code == 200:
+                return resp.json()["embedding"]
+        except Exception:
+            pass
+
+        # 2. Try Gemini fallback
+        if self._gemini is not None:
+            try:
+                resp = self._gemini.models.embed_content(
+                    model="text-embedding-004",
+                    contents=text,
+                )
+                if resp.embeddings and len(resp.embeddings) > 0:
+                    return resp.embeddings[0].values
+            except Exception as e:
+                print(f"  [!] Warning: Gemini single embedding fallback failed: {e}")
+
+        print(f"  [!] Warning: Failed to embed chunk. Returning zero vector.")
+        return [0.0] * PROSE_DIM
 
     # ------------------------------------------------------------------
     # Batch
@@ -73,17 +100,13 @@ class OllamaEmbeddingClient:
         model: str = PROSE_MODEL,
         batch_size: int = 32,
     ) -> list[list[float]]:
-        """Embed multiple texts. Splits into sub-batches of *batch_size*.
-
-        Uses /api/embed (batch endpoint) when available, falls back to
-        sequential /api/embeddings calls.
-        """
+        """Embed multiple texts. Splits into sub-batches of *batch_size*."""
         all_vectors: list[list[float]] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
             try:
                 vectors = self._embed_batch_api(batch, model)
-            except Exception as e:
+            except Exception:
                 # Fallback: sequential single calls
                 vectors = [self.embed_single(t, model) for t in batch]
             all_vectors.extend(vectors)
@@ -92,36 +115,57 @@ class OllamaEmbeddingClient:
     def _embed_batch_api(
         self, texts: list[str], model: str
     ) -> list[list[float]]:
-        """Call the Ollama batch /api/embed endpoint."""
-        resp = self._client.post(
-            f"{self.base_url}/api/embed",
-            json={"model": model, "input": texts},
-        )
-        resp.raise_for_status()
-        return resp.json()["embeddings"]
+        """Call the Ollama batch /api/embed endpoint, falling back to Gemini."""
+        # 1. Try local Ollama
+        try:
+            resp = self._client.post(
+                f"{self.base_url}/api/embed",
+                json={"model": model, "input": texts},
+            )
+            if resp.status_code == 200:
+                return resp.json()["embeddings"]
+        except Exception:
+            pass
+
+        # 2. Try Gemini fallback
+        if self._gemini is not None:
+            try:
+                resp = self._gemini.models.embed_content(
+                    model="text-embedding-004",
+                    contents=texts,
+                )
+                return [e.values for e in resp.embeddings]
+            except Exception as e:
+                print(f"  [!] Warning: Gemini batch embedding fallback failed: {e}")
+                raise
+
+        raise RuntimeError("No embedding provider available.")
 
     # ------------------------------------------------------------------
     # Health check
     # ------------------------------------------------------------------
 
     def is_available(self) -> bool:
-        """Check if Ollama is reachable."""
+        """Check if embedding capability is reachable."""
         try:
             resp = self._client.get(f"{self.base_url}/api/tags")
-            return resp.status_code == 200
-        except httpx.ConnectError:
-            return False
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        return self._gemini is not None
 
     def has_model(self, model: str) -> bool:
-        """Check if a specific model is pulled locally."""
+        """Check if the model is ready or if we have Gemini fallback."""
         try:
             resp = self._client.get(f"{self.base_url}/api/tags")
-            if resp.status_code != 200:
-                return False
-            models = resp.json().get("models", [])
-            return any(m.get("name", "").startswith(model) for m in models)
-        except httpx.ConnectError:
-            return False
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                if any(m.get("name", "").startswith(model) for m in models):
+                    return True
+        except Exception:
+            pass
+        return self._gemini is not None
 
     def close(self) -> None:
         self._client.close()

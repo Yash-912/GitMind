@@ -177,7 +177,7 @@ def query(req: QueryRequest, _: None = Security(_verify_key)):
         answer = result.answer
         model = result.model
     elif mode == "memo":
-        gen = DecisionMemoGenerator()
+        gen = DecisionMemoGenerator(strict_json=False)
         result = gen.generate(req.query, context)
         answer = result.raw_text
         model = result.model
@@ -231,16 +231,31 @@ def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Secu
     def _run_ingest():
         import subprocess, sys
         _tasks[task_id] = "running"
-        cmd = [sys.executable, "scripts/ingest.py", "--repo-path", req.repo_path]
+        
+        cmd_p1 = [sys.executable, "scripts/ingest.py", "--repo-path", req.repo_path]
         if req.github_repo:
-            cmd += ["--github-repo", req.github_repo]
+            cmd_p1 += ["--github-repo", req.github_repo]
         if req.max_commits:
-            cmd += ["--max-commits", str(req.max_commits)]
+            cmd_p1 += ["--max-commits", str(req.max_commits)]
+            
         try:
-            subprocess.run(cmd, check=True)
+            # Phase 1: Data ingestion
+            print(f"==> Starting Phase 1 ingestion for {req.github_repo or req.repo_path}...")
+            subprocess.run(cmd_p1, check=True)
+            
+            # Phase 2: Parsing & chunking
+            print("==> Starting Phase 2 parsing and chunking...")
+            subprocess.run([sys.executable, "scripts/run_phase2.py"], check=True)
+            
+            # Phase 3: Embedding & indexing
+            print("==> Starting Phase 3 embedding and indexing...")
+            subprocess.run([sys.executable, "scripts/run_phase3.py"], check=True)
+            
             _tasks[task_id] = "done"
         except subprocess.CalledProcessError as exc:
-            _tasks[task_id] = f"error: {exc}"
+            _tasks[task_id] = f"error in command: {exc}"
+        except Exception as exc:
+            _tasks[task_id] = f"unexpected error: {exc}"
 
     background_tasks.add_task(_run_ingest)
 

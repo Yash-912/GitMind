@@ -21,16 +21,18 @@ def _get_connection(db_path: str):
     """Return a sqlite3 connection.
 
     When DATABASE_URL points to a PostgreSQL instance we cannot use SQLite's
-    entity_index FTS5 table; in that case we fall back to an in-memory SQLite
-    db for the entity registry only (the actual documents are stored in
+    entity_index FTS5 table; in that case we fall back to a local SQLite
+    db file for the entity registry (the actual documents are stored in
     Postgres via DocumentStore).  This lets the existing code run unchanged
     while the structured data lives in Postgres.
     """
     from config.settings import settings
     if settings.database_url and not settings.database_url.startswith("sqlite"):
-        # Production with Postgres: use a local in-memory SQLite for FTS5
+        # Production with Postgres: use a local SQLite file for FTS5
+        import os
         import sqlite3
-        return sqlite3.connect(":memory:", check_same_thread=False)
+        os.makedirs("data", exist_ok=True)
+        return sqlite3.connect("data/entities.db", check_same_thread=False)
     import sqlite3
     return sqlite3.connect(db_path, check_same_thread=False)
 
