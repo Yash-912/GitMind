@@ -34,6 +34,22 @@ class GraphEdge:
         return f"{self.target_type}_{self.target_id}"
 
 
+def _get_connection(db_path: str):
+    """Return a sqlite3 connection, respecting DATABASE_URL env var.
+
+    When DATABASE_URL is a PostgreSQL URL the temporal graph still uses
+    an in-process SQLite file so that graph_edges traversal stays fast.
+    """
+    from config.settings import settings
+    if settings.database_url and not settings.database_url.startswith("sqlite"):
+        # Use a dedicated local file for the graph even when Postgres is the
+        # main store – avoids having to port the adjacency-list queries.
+        import os
+        os.makedirs("data", exist_ok=True)
+        return sqlite3.connect("data/graph.db", check_same_thread=False)
+    return sqlite3.connect(db_path, check_same_thread=False)
+
+
 class TemporalGraphBuilder:
     """Builds and persists the temporal causality graph in SQLite.
 
@@ -42,7 +58,7 @@ class TemporalGraphBuilder:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = _get_connection(db_path)
         self._setup_tables()
 
     def _setup_tables(self) -> None:

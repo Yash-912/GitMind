@@ -17,6 +17,24 @@ class EntityRecord:
     doc_ids: list[str] = field(default_factory=list)  # documents mentioning this entity
 
 
+def _get_connection(db_path: str):
+    """Return a sqlite3 connection.
+
+    When DATABASE_URL points to a PostgreSQL instance we cannot use SQLite's
+    entity_index FTS5 table; in that case we fall back to an in-memory SQLite
+    db for the entity registry only (the actual documents are stored in
+    Postgres via DocumentStore).  This lets the existing code run unchanged
+    while the structured data lives in Postgres.
+    """
+    from config.settings import settings
+    if settings.database_url and not settings.database_url.startswith("sqlite"):
+        # Production with Postgres: use a local in-memory SQLite for FTS5
+        import sqlite3
+        return sqlite3.connect(":memory:", check_same_thread=False)
+    import sqlite3
+    return sqlite3.connect(db_path, check_same_thread=False)
+
+
 class EntityRegistry:
     """Resolve entity surface forms to canonical names, persisted in SQLite.
 
@@ -28,7 +46,7 @@ class EntityRegistry:
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = _get_connection(db_path)
         self._cache: dict[str, EntityRecord] = {}  # canonical_name → EntityRecord
         self._setup_tables()
 

@@ -1,130 +1,170 @@
+"""interface/streamlit_app.py — GitMind dashboard.
+
+In production (HF Spaces) this app is a thin REST client that calls the
+FastAPI backend running in the same container on port 8000.
+Set the env var GITMIND_API_URL to point to a different backend.
+"""
 from __future__ import annotations
 
+import os
+import time
+
+import httpx
 import streamlit as st
 
-from config.settings import settings
-from indexing.qdrant_store import QdrantStore
-from indexing.bm25_index import BM25Index
-from indexing.fts_index import FTSIndex
-from retrieval import (
-    ChunkStore,
-    HybridRetriever,
-    GraphExpander,
-    CrossEncoderReranker,
-    ContextAssembler,
-    QueryDecomposer,
-    EntityResolver,
+# ------------------------------------------------------------------ #
+# Config                                                               #
+# ------------------------------------------------------------------ #
+
+# When running inside HF Spaces the FastAPI server starts on port 8000
+# and Streamlit on port 7860.  GITMIND_API_URL defaults to localhost.
+API_URL = os.getenv("GITMIND_API_URL", "http://localhost:8000")
+API_KEY = os.getenv("API_KEY", "")  # optional — matches the FastAPI secret
+
+_HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
+
+# ------------------------------------------------------------------ #
+# Helpers                                                              #
+# ------------------------------------------------------------------ #
+
+
+def _post(path: str, payload: dict) -> dict:
+    with httpx.Client(base_url=API_URL, timeout=180.0) as client:
+        resp = client.post(path, json=payload, headers=_HEADERS)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _get(path: str) -> dict:
+    with httpx.Client(base_url=API_URL, timeout=30.0) as client:
+        resp = client.get(path, headers=_HEADERS)
+        resp.raise_for_status()
+        return resp.json()
+
+
+# ------------------------------------------------------------------ #
+# Page layout                                                          #
+# ------------------------------------------------------------------ #
+
+st.set_page_config(
+    page_title="GitMind — Codebase Archaeology",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-from generation import (
-    DirectQAGenerator,
-    DecisionMemoGenerator,
-    BlameMapGenerator,
-    RiskReportGenerator,
+
+# ---- Sidebar ----
+with st.sidebar:
+    st.image(
+        "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
+        width=40,
+    )
+    st.title("GitMind")
+    st.caption("Ask **why** questions about your codebase history.")
+
+    st.divider()
+
+    # Health check
+    with st.expander("🔌 Backend status", expanded=False):
+        if st.button("Check"):
+            try:
+                data = _get("/health")
+                if data.get("status") == "ok":
+                    st.success("API is healthy ✅")
+                else:
+                    st.warning("API degraded ⚠️")
+                st.json(data)
+            except Exception as exc:
+                st.error(f"Cannot reach API: {exc}")
+
+    st.divider()
+
+    # Ingestion
+    st.subheader("📥 Ingest Repository")
+    repo_path = st.text_input("Local repo path", value=".")
+    github_repo = st.text_input("GitHub repo (owner/name)", value="")
+    max_commits = st.number_input("Max commits (0 = all)", value=0, min_value=0)
+
+    if st.button("Start Ingestion"):
+        with st.spinner("Triggering ingestion…"):
+            try:
+                payload: dict = {"repo_path": repo_path}
+                if github_repo:
+                    payload["github_repo"] = github_repo
+                if max_commits:
+                    payload["max_commits"] = max_commits
+                resp = _post("/api/v1/ingest", payload)
+                st.success(f"Ingestion started — task `{resp.get('task_id', '?')}`")
+            except Exception as exc:
+                st.error(f"Ingestion failed: {exc}")
+
+# ---- Main area ----
+st.title("🧠 GitMind — Codebase Archaeology")
+st.write(
+    "Ask natural language questions about **why** your codebase is the way it is. "
+    "GitMind reconstructs institutional knowledge from git history, PRs, and issues."
 )
 
+query = st.text_area(
+    "Your question",
+    placeholder="e.g. Why does the auth module use JWT instead of session cookies?",
+    height=80,
+)
 
-st.set_page_config(page_title="GitMind", page_icon="🧠", layout="wide")
-st.title("GitMind — Codebase Archaeology")
+col1, col2, col3 = st.columns([2, 2, 2])
+with col1:
+    mode = st.selectbox(
+        "Answer mode",
+        options=["direct", "memo", "blame", "risk"],
+        format_func=lambda x: {
+            "direct": "📝 Direct Q&A",
+            "memo": "📋 Decision Memo",
+            "blame": "👤 Blame Map",
+            "risk": "⚠️ Risk Report",
+        }[x],
+    )
+with col2:
+    top_k = st.slider("Evidence chunks (top-k)", min_value=3, max_value=20, value=12)
+with col3:
+    limit = st.slider("Retrieval candidates", min_value=10, max_value=100, value=40)
 
-query = st.text_input("Ask a question about the code history")
-mode = st.selectbox("Mode", ["direct", "memo", "blame", "risk"], index=0)
+run = st.button("🔍 Answer", type="primary", disabled=not query.strip())
 
-if st.button("Answer") and query:
-    try:
-        chunk_store = None
-        qdrant = None
-        bm25 = None
-        fts = None
-        decomposer = None
-        resolver = None
-        retriever = None
-        expander = None
-        generator = None
+if run and query.strip():
+    with st.spinner("Retrieving and generating answer…"):
+        t0 = time.time()
         try:
-            chunk_store = ChunkStore(str(st.session_state.get("chunks_path", settings.data_dir + "/chunks.jsonl")))
-            qdrant = QdrantStore(path=settings.qdrant_path)
-            bm25 = BM25Index(index_dir=settings.bm25_index_dir)
-            fts = FTSIndex(db_path=settings.db_path)
-
-            decomposer = QueryDecomposer()
-            plan = decomposer.decompose(query)
-            resolver = EntityResolver(settings.db_path)
-            module_tags = resolver.resolve(plan.entities)
-
-            retriever = HybridRetriever(qdrant=qdrant, bm25=bm25, fts=fts, chunk_store=chunk_store)
-            candidates = retriever.retrieve(
-                query,
-                limit=40,
-                filters={
-                    "time_start": plan.time_start,
-                    "time_end": plan.time_end,
-                    "module_tags": module_tags,
-                },
+            data = _post(
+                "/api/v1/query",
+                {"query": query, "mode": mode, "top_k": top_k, "limit": limit},
             )
+            elapsed = time.time() - t0
 
-            expander = GraphExpander(db_path=settings.db_path, chunk_store=chunk_store, hop_depth=1)
-            expanded = expander.expand(candidates)
+            st.success(f"Done in {elapsed:.1f}s  •  Model: `{data.get('model', '?')}`")
 
-            reranker = CrossEncoderReranker()
-            reranked = reranker.rerank(query, expanded, top_k=12)
-
-            assembler = ContextAssembler(max_tokens=3000)
-            context = assembler.assemble(reranked)
-
-            if mode == "direct":
-                generator = DirectQAGenerator()
-                result = generator.generate(query, context)
-                answer = result.answer
-                model = result.model
-            elif mode == "memo":
-                generator = DecisionMemoGenerator()
-                result = generator.generate(query, context)
-                answer = result.raw_text
-                model = result.model
-            elif mode == "blame":
-                generator = BlameMapGenerator()
-                result = generator.generate(query, context)
-                answer = result.raw_text
-                model = result.model
-            else:
-                generator = RiskReportGenerator()
-                result = generator.generate(query, context)
-                answer = result.raw_text
-                model = result.model
-
+            # Answer
             st.subheader("Answer")
-            st.caption(f"Model: {model}")
-            st.write(answer)
+            st.write(data.get("answer", ""))
 
-            st.subheader("Evidence")
-            st.dataframe(
-                [
+            # Evidence table
+            evidence = data.get("evidence", [])
+            if evidence:
+                st.subheader(f"Evidence ({len(evidence)} chunks)")
+                rows = [
                     {
-                        "doc_type": c.metadata.get("doc_type", ""),
-                        "doc_id": c.metadata.get("doc_id", ""),
-                        "score": c.score,
-                        "source": c.source,
+                        "score": f"{e['score']:.4f}",
+                        "source": e["source"],
+                        "doc_type": e["doc_type"],
+                        "doc_id": e["doc_id"],
+                        "author": e["author"],
+                        "timestamp": e["timestamp"][:10] if e["timestamp"] else "",
+                        "snippet": e["snippet"],
                     }
-                    for c in reranked
+                    for e in evidence
                 ]
-            )
+                st.dataframe(rows, use_container_width=True)
 
-            with st.expander("Context"):
-                st.text(context)
+        except httpx.HTTPStatusError as exc:
+            st.error(f"API error {exc.response.status_code}: {exc.response.text}")
         except Exception as exc:
-            st.error(f"Failed to generate answer: {exc}")
-        finally:
-            if expander is not None:
-                expander.close()
-            if retriever is not None:
-                retriever.close()
-            if decomposer is not None:
-                decomposer.close()
-            if resolver is not None:
-                resolver.close()
-            if qdrant is not None:
-                qdrant.close()
-            if fts is not None:
-                fts.close()
-            if generator is not None:
-                generator.close()
+            st.error(f"Request failed: {exc}")

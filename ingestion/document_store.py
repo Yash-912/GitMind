@@ -15,9 +15,41 @@ class Document(SQLModel, table=True):
     payload_json: str
 
 
+def _make_engine(db_path: str | None = None):
+    """Create a SQLAlchemy engine.
+
+    In production (HF Spaces / Neon / Supabase), the DATABASE_URL env var
+    holds a full postgresql+psycopg2://... connection string and takes
+    priority over the local db_path.
+    """
+    from config.settings import settings
+
+    url = settings.database_url or (
+        f"sqlite:///{db_path}" if db_path else f"sqlite:///{settings.db_path}"
+    )
+
+    connect_args: dict = {}
+    if url.startswith("sqlite"):
+        # Enable WAL mode to allow concurrent readers during writes.
+        connect_args = {"check_same_thread": False}
+
+    engine = create_engine(url, connect_args=connect_args)
+
+    # Enable WAL journal mode for SQLite (no-op on Postgres).
+    if url.startswith("sqlite"):
+        from sqlalchemy import event, text
+
+        @event.listens_for(engine, "connect")
+        def set_wal(dbapi_conn, _):
+            dbapi_conn.execute("PRAGMA journal_mode=WAL")
+            dbapi_conn.execute("PRAGMA synchronous=NORMAL")
+
+    return engine
+
+
 class DocumentStore:
-    def __init__(self, db_path: str) -> None:
-        self.engine = create_engine(f"sqlite:///{db_path}")
+    def __init__(self, db_path: str | None = None) -> None:
+        self.engine = _make_engine(db_path)
         SQLModel.metadata.create_all(self.engine)
 
     def upsert_document(self, doc_type: str, doc_id: str, payload: dict) -> None:

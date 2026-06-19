@@ -1,10 +1,21 @@
+---
+title: GitMind
+emoji: 🧠
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+short_description: Ask "why" questions about any codebase history using RAG + temporal graphs
+---
+
 # GitMind
 
 GitMind is a codebase archaeology tool that reconstructs architectural decisions from a repository's history. It ingests commits, diffs, PRs, issues, and changelogs; builds a temporal graph; and answers "why" questions with evidence-backed retrieval.
 
 ## What It Does
 
-- Ingests local git history and GitHub PR/issue data into SQLite.
+- Ingests local git history and GitHub PR/issue data.
 - Parses documents into typed records and extracts entities.
 - Chunks and embeds code, prose, and diffs for hybrid retrieval.
 - Expands results via a temporal graph of causality.
@@ -14,96 +25,73 @@ GitMind is a codebase archaeology tool that reconstructs architectural decisions
 
 ```
 Sources (git + GitHub)
-	-> Ingestion (SQLite)
+	-> Ingestion (SQLite / PostgreSQL)
 		-> Parsing + Entities
-			-> Chunking + Embedding
-				-> Indexing (Qdrant + BM25 + SQLite FTS5)
-					-> Retrieval + Rerank
-						-> Generation + Evaluation
+			-> Chunking + Embedding (Ollama / nomic-embed-text)
+				-> Indexing (Qdrant Cloud + BM25 + FTS5)
+					-> Retrieval + Rerank (cross-encoder)
+						-> Generation (Gemini 1.5 Flash)
 ```
 
-## Requirements
+## Production Deployment (Hugging Face Spaces)
 
-- Python 3.10+ recommended
-- Optional: GitHub token for PR/issue ingestion
-- Optional: Qdrant (local or server) for vector indexing
+This project is deployed as a Docker Space on Hugging Face Spaces.
 
-## Setup
+### Required Secrets (set in HF Space Settings → Repository secrets)
+
+| Secret | Description |
+|---|---|
+| `GEMINI_API_KEY` | Google AI Studio API key |
+| `QDRANT_URL` | Qdrant Cloud cluster URL |
+| `QDRANT_API_KEY` | Qdrant Cloud API key |
+| `DATABASE_URL` | PostgreSQL connection string (Neon / Supabase) |
+| `GITHUB_TOKEN` | GitHub Personal Access Token (for PR/issue ingestion) |
+| `API_KEY` | Optional secret to restrict access to the REST API |
+
+### Local Development
 
 ```bash
+# 1. Copy and fill in environment variables
+cp .env.example .env
+
+# 2. Start all services with Docker Compose
+docker compose up --build
+```
+
+Open:
+- **Streamlit UI**: http://localhost:7860
+- **FastAPI docs**: http://localhost:8000/docs
+
+### Manual Local Run (without Docker)
+
+```bash
+# Install dependencies
 pip install -r requirements.txt
-```
+python -m spacy download en_core_web_sm
 
-Copy and edit `.env.example` to `.env`.
-
-## Quickstart (Phases 1-5)
-
-1) Ingest repository and GitHub data
-
-```bash
+# Run ingestion
 python scripts/ingest.py --repo-path . --github-repo <owner/repo>
-```
-
-If `GITHUB_TOKEN` is set in `.env`, GitHub PRs and issues will be ingested.
-
-2) Parse + entities + chunking
-
-```bash
 python scripts/run_phase2.py
-```
-
-3) Embedding + indexing
-
-```bash
 python scripts/run_phase3.py
-```
 
-4) Retrieval demo
+# Start API server
+uvicorn api.main:app --port 8000 --reload
 
-```bash
-python scripts/run_retrieval.py "why was auth changed"
-```
-
-The retrieval demo uses LLM-based query decomposition and entity resolution when a Gemini key is available, with heuristic fallbacks otherwise.
-
-5) End-to-end answer demo
-
-```bash
-python scripts/run_answer.py "why was auth changed" --mode direct
-```
-
-## Evaluation (Phase 6)
-
-Build a QA dataset:
-
-```bash
-python -m interface.cli build-dataset data/chunks.jsonl data/qa_pairs.jsonl --limit 50 --dry-run
-```
-
-Run RAGAS evaluation:
-
-```bash
-python -m interface.cli evaluate data/qa_pairs.jsonl --limit 20
-```
-
-## UI (Phase 7)
-
-```bash
+# Start Streamlit (in another terminal)
 streamlit run interface/streamlit_app.py
 ```
 
 ## Configuration
 
-- App settings: [config/settings.py](config/settings.py)
-- Environment variables: `.env`
-
-Common toggles include API keys for LLM providers and embedding backends.
+All settings live in `config/settings.py` and are read from environment variables or `.env`.
 
 ## Data Stores
 
-- SQLite: document store, ingestion checkpoints, entity registry, temporal graph, FTS index
-- Qdrant: vector index payloads for retrieval
-- BM25: lightweight keyword index (local files)
+| Store | Local | Production |
+|---|---|---|
+| Document / graph | SQLite | PostgreSQL (Neon / Supabase) |
+| Vector index | Qdrant (local file) | Qdrant Cloud |
+| Keyword index | BM25 (local file) | BM25 (rebuilt on startup) |
 
 ## Tests
 
@@ -111,22 +99,10 @@ Common toggles include API keys for LLM providers and embedding backends.
 pytest -q
 ```
 
-Expected warning (local Qdrant payload indexes):
-
-```
-UserWarning: Payload indexes have no effect in the local Qdrant.
-```
-
 ## Project Notes
 
-- Full product spec and architecture: [gitmind_prd.md](gitmind_prd.md)
+- Full product spec: [gitmind_prd.md](gitmind_prd.md)
 - Build log: [BUILD_LOG.md](BUILD_LOG.md)
-
-## Roadmap Ideas
-
-- Better cross-repo linking for monorepos
-- Web UI with timelines and evidence graphs
-- Pluggable vector backends
 
 ## License
 

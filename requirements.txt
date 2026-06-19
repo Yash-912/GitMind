@@ -43,3 +43,10 @@ sentence-transformers
 # Dev / Testing
 pytest
 pytest-asyncio
+
+# Production — API server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Production — PostgreSQL support (for Neon / Supabase)
+psycopg2-binary

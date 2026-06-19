@@ -34,7 +34,8 @@ class SearchResult:
 class QdrantStore:
     """Manages a Qdrant collection with named vectors: 'semantic' + 'code'.
 
-    Uses Qdrant local mode (no server, persists to disk).
+    Connects to Qdrant Cloud when QDRANT_URL + QDRANT_API_KEY are configured,
+    otherwise falls back to a local on-disk mode for development.
     """
 
     def __init__(
@@ -47,7 +48,18 @@ class QdrantStore:
         self.collection_name = collection_name
         self.semantic_dim = semantic_dim
         self.code_dim = code_dim
-        self.client = QdrantClient(path=path)
+
+        from config.settings import settings as _s
+        if _s.qdrant_url and _s.qdrant_api_key:
+            # Production: connect to Qdrant Cloud
+            self.client = QdrantClient(
+                url=_s.qdrant_url,
+                api_key=_s.qdrant_api_key,
+            )
+        else:
+            # Development: local on-disk storage
+            self.client = QdrantClient(path=path)
+
         self._ensure_collection()
 
     # ------------------------------------------------------------------
