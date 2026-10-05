@@ -30,6 +30,7 @@ class CheckpointStore:
         last_commit_sha: str | None = None,
         last_pr_updated_at: str | None = None,
         last_issue_updated_at: str | None = None,
+        commit: bool = True,
     ) -> IngestionCheckpoint:
         checkpoint = self.get(repo)
         now = datetime.now(timezone.utc).isoformat()
@@ -50,6 +51,8 @@ class CheckpointStore:
             if last_issue_updated_at is not None:
                 checkpoint.last_issue_updated_at = last_issue_updated_at
             checkpoint.updated_at = now
-        self.session.commit()
-        self.session.refresh(checkpoint)
+        self.session.flush()
+        if commit:
+            self.session.commit()
+            self.session.refresh(checkpoint)
         return checkpoint

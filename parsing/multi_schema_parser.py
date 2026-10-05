@@ -21,6 +21,9 @@ class ParsedCommit:
     file_paths: list[str]
     hunks: list[DiffHunk]
     stats: dict[str, int]
+    parent_shas: list[str] = field(default_factory=list)
+    committed_at: datetime | None = None
+    diff_status: str = "complete"
 
 
 @dataclass
@@ -123,6 +126,9 @@ class MultiSchemaParser:
             file_paths=payload.get("file_paths", []),
             hunks=hunks,
             stats=payload.get("stats", {}),
+            parent_shas=payload.get("parent_shas", []),
+            committed_at=_parse_dt(payload.get("committed_at")),
+            diff_status=payload.get("diff_status", "complete"),
         )
 
     def parse_pr(self, payload: dict[str, Any]) -> ParsedPR:

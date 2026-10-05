@@ -64,7 +64,8 @@ class DiffParser:
         for patched_file in patch_set:
             old_path = patched_file.source_file or ""
             new_path = patched_file.target_file or ""
-            file_path = new_path.lstrip("b/") if new_path.startswith("b/") else new_path
+            effective_path = old_path if new_path == "/dev/null" else new_path
+            file_path = effective_path[2:] if effective_path.startswith(("a/", "b/")) else effective_path
             for hunk in patched_file:
                 lines = [str(l) for l in hunk]
                 hunks.append(
@@ -112,7 +113,8 @@ class DiffParser:
                 old_count = int(m.group(2)) if m.group(2) else 1
                 new_start = int(m.group(3))
                 new_count = int(m.group(4)) if m.group(4) else 1
-                file_path = current_file_new.lstrip("b/") if current_file_new.startswith("b/") else current_file_new
+                effective_path = current_file_old if current_file_new == "/dev/null" else current_file_new
+                file_path = effective_path[2:] if effective_path.startswith(("a/", "b/")) else effective_path
                 current_hunk = DiffHunk(
                     file_path=file_path,
                     old_path=current_file_old,

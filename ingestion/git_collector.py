@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
 
-from git import Repo
+from git import NULL_TREE, Repo
+from git.exc import GitCommandError
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,11 @@ class CommitRecord:
     diff_text: str
     file_changes: list[dict]
     stats: dict
+    parent_shas: list[str] = field(default_factory=list)
+    committed_at: str = ""
+    diff_base_sha: str | None = None
+    diff_status: str = "complete"
+    diff_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,25 +43,81 @@ def _isoformat(dt: datetime) -> str:
 
 
 class GitCollector:
-    def __init__(self, repo_path: str) -> None:
+    def __init__(self, repo_path: str, allow_incomplete: bool = False) -> None:
         self.repo_path = repo_path
         self.repo = Repo(repo_path)
+        self.allow_incomplete = allow_incomplete
+
+    @property
+    def is_shallow(self) -> bool:
+        return self.repo.git.rev_parse("--is-shallow-repository").strip() == "true"
+
+    def close(self) -> None:
+        self.repo.close()
 
     def iter_commits(
         self,
         since_sha: str | None = None,
         max_count: int | None = None,
+        oldest_first: bool = False,
+        exclude_shas: set[str] | None = None,
     ) -> Iterable[CommitRecord]:
+        if max_count is not None and max_count < 1:
+            raise ValueError("max_count must be positive, or None for all commits")
+        if self.is_shallow and not self.allow_incomplete:
+            raise ValueError(
+                "Repository history is shallow. Fetch the complete history or explicitly allow incomplete history."
+            )
+        if not self.repo.head.is_valid():
+            return
+        revision = "HEAD"
+        if since_sha:
+            try:
+                self.repo.commit(since_sha)
+                self.repo.git.merge_base("--is-ancestor", since_sha, "HEAD")
+            except (ValueError, GitCommandError) as exc:
+                raise ValueError(
+                    "The saved commit is not an ancestor of HEAD. Use a full collection to reset the checkpoint."
+                ) from exc
+            revision = f"{since_sha}..HEAD"
         count = 0
-        for commit in self.repo.iter_commits():
-            if since_sha and commit.hexsha == since_sha:
-                break
+        for commit in self.repo.iter_commits(
+            rev=revision, reverse=oldest_first, topo_order=True
+        ):
+            if exclude_shas and commit.hexsha in exclude_shas:
+                continue
             if max_count is not None and count >= max_count:
                 break
 
+            parent_shas = [p.hexsha for p in commit.parents]
+            diff_status, diff_error = "complete", None
+            diff_text = ""
             try:
                 parent = commit.parents[0] if commit.parents else None
-                diffs = commit.diff(parent, create_patch=True)
+                # Diff the old tree against the new tree, including root additions.
+                diffs = parent.diff(commit) if parent else commit.diff(NULL_TREE)
+                if parent:
+                    diff_text = self.repo.git.diff(
+                        parent.hexsha,
+                        commit.hexsha,
+                        "--",
+                        no_ext_diff=True,
+                        no_textconv=True,
+                        no_color=True,
+                        find_renames=True,
+                    )
+                else:
+                    diff_text = self.repo.git.show(
+                        commit.hexsha,
+                        format="",
+                        root=True,
+                        no_ext_diff=True,
+                        no_textconv=True,
+                        no_color=True,
+                        find_renames=True,
+                    )
+                if diff_text:
+                    diff_text += "\n"
                 stats_obj = commit.stats
                 stats_total = {
                     "files": int(stats_obj.total.get("files", 0)),
@@ -63,14 +125,18 @@ class GitCollector:
                     "deletions": int(stats_obj.total.get("deletions", 0)),
                 }
                 file_stats = stats_obj.files
-            except Exception as exc:
-                # Handle shallow clone boundary where parent commit is missing, or other git command failures
-                print(f"[git] Warning: could not get diff/stats for commit {commit.hexsha} (likely shallow clone boundary): {exc}")
+            except (GitCommandError, ValueError, OSError) as exc:
+                if not self.allow_incomplete:
+                    raise RuntimeError(
+                        f"Cannot collect diff/stats for commit {commit.hexsha}; no successful record was stored."
+                    ) from exc
+                diff_status = "unavailable"
+                diff_error = f"{type(exc).__name__}: diff or statistics unavailable"
+                diff_text = ""
                 diffs = []
                 stats_total = {"files": 0, "insertions": 0, "deletions": 0}
                 file_stats = {}
 
-            diff_text = "".join(d.diff.decode("utf-8", errors="replace") for d in diffs)
             file_paths = [d.b_path or d.a_path or "" for d in diffs]
 
             file_changes: list[FileChange] = []
@@ -104,6 +170,11 @@ class GitCollector:
                 diff_text=diff_text,
                 file_changes=[fc.__dict__ for fc in file_changes],
                 stats=stats_total,
+                parent_shas=parent_shas,
+                committed_at=_isoformat(commit.committed_datetime),
+                diff_base_sha=parent_shas[0] if parent_shas else None,
+                diff_status=diff_status,
+                diff_error=diff_error,
             )
             yield record
             count += 1
@@ -112,5 +183,10 @@ class GitCollector:
         self,
         since_sha: str | None = None,
         max_count: int | None = None,
+        oldest_first: bool = False,
     ) -> list[CommitRecord]:
-        return list(self.iter_commits(since_sha=since_sha, max_count=max_count))
+        return list(
+            self.iter_commits(
+                since_sha=since_sha, max_count=max_count, oldest_first=oldest_first
+            )
+        )

@@ -11,14 +11,22 @@ short_description: Ask "why" questions about codebase history using RAG
 
 # GitMind
 
-GitMind is a codebase archaeology tool that reconstructs architectural decisions from a repository's history. It ingests commits, diffs, PRs, issues, and changelogs; builds a temporal graph; and answers "why" questions with evidence-backed retrieval.
+Implementation and verification are tracked phase by phase in [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md). Phase 1 establishes ingestion correctness and resume behavior. Production readiness and evaluation targets remain pending.
+
+GitMind is a codebase archaeology prototype. The target design answers current-code questions from a selected snapshot and expands historical evidence when required. The existing pipeline collects git and GitHub records for retrieval and generation.
+
+## Ingestion Direction
+
+The planned default is selective current-code ingestion, followed by incremental indexing. Download and process selected source files, tests, documentation and configuration at a pinned commit. Update only changed content. Collect relevant commits, PRs and issues when a history question requires them. Full-history collection becomes an explicit background mode with resource limits.
+
+**Current status:** these selective modes are not implemented yet. Phase 1 still defaults to full cloning and broad requested-source collection. Its checkpoints support collection resume; they do not yet update code indices incrementally. See [docs/INGESTION_DESIGN.md](docs/INGESTION_DESIGN.md).
 
 ## What It Does
 
 - Ingests local git history and GitHub PR/issue data.
 - Parses documents into typed records and extracts entities.
-- Chunks and embeds code, prose, and diffs for hybrid retrieval.
-- Expands results via a temporal graph of causality.
+- Chunks and embeds collected prose and diffs for hybrid retrieval. Current-code file indexing is planned.
+- Expands results through stored document relationships. Temporal and causal reasoning remain acceptance requirements.
 - Generates direct answers or decision memos with citations.
 
 ## Architecture (At a Glance)
@@ -69,9 +77,9 @@ Open:
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 
-# Run ingestion
-python scripts/ingest.py --repo-path . --github-repo <owner/repo>
-python scripts/run_phase2.py
+# Current broad-collection workflow; selective ingestion is planned
+python scripts/ingest.py --github-repo <owner/repo>
+python scripts/run_phase2.py --repo <owner/repo>
 python scripts/run_phase3.py
 
 # Start API server
@@ -101,6 +109,9 @@ pytest -q
 
 ## Project Notes
 
+- Implementation status and acceptance requirements: [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md)
+- Selective ingestion, incremental indexing, and collection budgets: [docs/INGESTION_DESIGN.md](docs/INGESTION_DESIGN.md)
+- Phase 1 changes, collection scope, and resume commands: [docs/PHASE1.md](docs/PHASE1.md)
 - Full product spec: [gitmind_prd.md](gitmind_prd.md)
 - Build log: [BUILD_LOG.md](BUILD_LOG.md)
 

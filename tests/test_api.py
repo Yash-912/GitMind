@@ -160,7 +160,23 @@ def test_ingest_endpoint(mock_run, client):
         assert status_response.status_code == 200
         status_data = status_response.json()
         assert status_data["status"] in ["started", "running", "done"]
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert commands[1][-2:] == ["--repo", "owner/repo"]
 
+    finally:
+        settings.api_key = original_api_key
+
+
+@patch("subprocess.run")
+def test_github_ingestion_default_path_clones_requested_repository(mock_run, client):
+    original_api_key = settings.api_key
+    settings.api_key = None
+    try:
+        response = client.post("/api/v1/ingest", json={"github_repo":"owner/repo"})
+        assert response.status_code == 200
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert "--repo-path" not in commands[0]
+        assert commands[1][-2:] == ["--repo", "owner/repo"]
     finally:
         settings.api_key = original_api_key
 

@@ -241,7 +241,10 @@ def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Secu
         # always correct regardless of Docker entrypoint directory.
         project_root = str(_Path(__file__).resolve().parent.parent)
 
-        cmd_p1 = [sys.executable, "-u", "scripts/ingest.py", "--repo-path", req.repo_path]
+        cmd_p1 = [sys.executable, "-u", "scripts/ingest.py"]
+        # The UI's default '.' is a placeholder when a GitHub repository is supplied.
+        if not req.github_repo or req.repo_path != ".":
+            cmd_p1 += ["--repo-path", req.repo_path]
         if req.github_repo:
             cmd_p1 += ["--github-repo", req.github_repo]
         if req.max_commits:
@@ -254,7 +257,17 @@ def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Secu
 
             # Phase 2: Parsing & chunking
             print("==> Starting Phase 2 parsing and chunking...")
-            subprocess.run([sys.executable, "-u", "scripts/run_phase2.py"], check=True, cwd=project_root)
+            from ingestion.repository import normalize_github_repo, repository_identity
+            if req.github_repo:
+                repo_id = normalize_github_repo(req.github_repo)
+            else:
+                from git import Repo
+                local_path = _Path(req.repo_path)
+                if not local_path.is_absolute():
+                    local_path = _Path(project_root) / local_path
+                with Repo(local_path) as local_repo:
+                    repo_id = repository_identity(local_repo)
+            subprocess.run([sys.executable, "-u", "scripts/run_phase2.py", "--repo", repo_id], check=True, cwd=project_root)
 
             # Phase 3: Embedding & indexing
             print("==> Starting Phase 3 embedding and indexing...")

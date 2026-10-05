@@ -25,7 +25,10 @@ def _link_id(
 
 
 class CrossReferenceLinker:
-    issue_pattern = re.compile(r"#(\d+)")
+    issue_pattern = re.compile(r"(?<![\w/])#(\d+)")
+    closes_pattern = re.compile(
+        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
+    )
 
     def link_prs_to_issues(
         self, prs: Iterable[PullRequestRecord], issues: Iterable[IssueRecord]
@@ -33,9 +36,9 @@ class CrossReferenceLinker:
         issue_map = {str(issue.number): issue for issue in issues}
         links: list[LinkRecord] = []
         for pr in prs:
-            matches = self.issue_pattern.findall(pr.body or "") + self.issue_pattern.findall(
-                pr.title or ""
-            )
+            matches = self.issue_pattern.findall(
+                pr.body or ""
+            ) + self.issue_pattern.findall(pr.title or "")
             for issue_id in set(matches):
                 if issue_id in issue_map:
                     links.append(
@@ -50,6 +53,56 @@ class CrossReferenceLinker:
                             relation="mentions",
                         )
                     )
+            if pr.merged_at:
+                for issue_id in set(self.closes_pattern.findall(pr.body or "")):
+                    if issue_id in issue_map:
+                        links.append(
+                            LinkRecord(
+                                _link_id(
+                                    "pr", str(pr.number), "issue", issue_id, "closes"
+                                ),
+                                "pr",
+                                str(pr.number),
+                                "issue",
+                                issue_id,
+                                "closes",
+                            )
+                        )
+        return links
+
+    def link_commit_parents(self, commits: Iterable[CommitRecord]) -> list[LinkRecord]:
+        links = []
+        for commit in commits:
+            for parent in commit.parent_shas:
+                links.append(
+                    LinkRecord(
+                        _link_id("commit", parent, "commit", commit.sha, "parent"),
+                        "commit",
+                        parent,
+                        "commit",
+                        commit.sha,
+                        "parent",
+                    )
+                )
+        return links
+
+    def link_commits_to_issues(
+        self, commits: Iterable[CommitRecord], issues: Iterable[IssueRecord]
+    ) -> list[LinkRecord]:
+        issue_ids = {str(issue.number) for issue in issues}
+        links = []
+        for commit in commits:
+            for issue_id in set(self.issue_pattern.findall(commit.message)) & issue_ids:
+                links.append(
+                    LinkRecord(
+                        _link_id("commit", commit.sha, "issue", issue_id, "references"),
+                        "commit",
+                        commit.sha,
+                        "issue",
+                        issue_id,
+                        "references",
+                    )
+                )
         return links
 
     def link_commits_to_prs(

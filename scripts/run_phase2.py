@@ -12,6 +12,7 @@ Phase 2 pipeline, and writes:
 from __future__ import annotations
 
 import json
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -38,15 +39,39 @@ from chunking import (
 )
 
 
-def load_documents(store: DocumentStore, doc_type: str) -> list[dict]:
+def load_documents(store: DocumentStore, doc_type: str, repo: str) -> list[dict]:
     with Session(store.engine) as session:
         rows = session.exec(
-            select(Document).where(Document.doc_type == doc_type)
+            select(Document).where(Document.doc_type == doc_type, Document.repo == repo)
         ).all()
         return [json.loads(r.payload_json) for r in rows]
 
 
-def run_phase2() -> None:
+def select_repository(store: DocumentStore, requested: str | None) -> str:
+    """Never combine documents from unrelated repositories during parsing."""
+    with Session(store.engine) as session:
+        available = set(session.exec(select(Document.repo).distinct()).all())
+    if requested == "legacy":
+        if "" not in available:
+            raise ValueError("No legacy documents are present")
+        return ""
+    if requested:
+        from ingestion.repository import normalize_github_repo
+        requested = requested if requested.startswith("file:") else normalize_github_repo(requested)
+        if requested not in available:
+            raise ValueError("No documents exist for this repository. Ingest it first; use --repo legacy only to inspect old unscoped data.")
+        return requested
+    scoped = available - {""}
+    if len(scoped) == 1:
+        return next(iter(scoped))
+    if scoped:
+        raise ValueError("Multiple repositories are present. Select one with --repo.")
+    if "" in available:
+        raise ValueError("Only unscoped legacy data is present. Re-ingest the repository, or explicitly select --repo legacy.")
+    raise ValueError("No documents are present. Run ingestion first.")
+
+
+def run_phase2(repo_id: str | None = None) -> None:
     print("=" * 60)
     print("GitMind — Phase 2: Parsing, Entities & Chunking")
     print("=" * 60)
@@ -54,9 +79,10 @@ def run_phase2() -> None:
     db_path = settings.db_path
     data_dir = Path(settings.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    repo = settings.github_repo or "unknown"
-
     store = DocumentStore(db_path)
+    repo = select_repository(store, repo_id)
+    if not repo:
+        print("WARNING: Legacy documents have no verified repository identity.")
     parser = MultiSchemaParser()
     extractor = EntityExtractor()
     registry = EntityRegistry(db_path)
@@ -76,7 +102,7 @@ def run_phase2() -> None:
 
     # ------------------------------------------------------------------ commits
     print("\n[1/5] Processing commits...")
-    commit_payloads = load_documents(store, "commit")
+    commit_payloads = load_documents(store, "commit", repo)
     print(f"  Found {len(commit_payloads)} commit documents")
     parsed_commits = []
     for payload in commit_payloads:
@@ -101,7 +127,7 @@ def run_phase2() -> None:
 
     # ------------------------------------------------------------------ PRs
     print("\n[2/5] Processing pull requests...")
-    pr_payloads = load_documents(store, "pr")
+    pr_payloads = load_documents(store, "pr", repo)
     print(f"  Found {len(pr_payloads)} PR documents")
     parsed_prs = []
     for payload in pr_payloads:
@@ -124,7 +150,7 @@ def run_phase2() -> None:
 
     # ------------------------------------------------------------------ Issues
     print("\n[3/5] Processing issues...")
-    issue_payloads = load_documents(store, "issue")
+    issue_payloads = load_documents(store, "issue", repo)
     print(f"  Found {len(issue_payloads)} issue documents")
     parsed_issues = []
     for payload in issue_payloads:
@@ -144,7 +170,7 @@ def run_phase2() -> None:
 
     # ------------------------------------------------------------------ Releases
     print("\n[4/5] Processing releases...")
-    release_payloads = load_documents(store, "release")
+    release_payloads = load_documents(store, "release", repo)
     print(f"  Found {len(release_payloads)} release documents")
     for payload in release_payloads:
         pr_rel = parser.parse_release(payload)
@@ -153,7 +179,7 @@ def run_phase2() -> None:
 
     # ------------------------------------------------------------------ CI/CD Runs
     print("\n[4b/5] Processing CI/CD runs...")
-    cicd_payloads = load_documents(store, "cicd")
+    cicd_payloads = load_documents(store, "cicd", repo)
     print(f"  Found {len(cicd_payloads)} CI/CD documents")
     for payload in cicd_payloads:
         pc = parser.parse_cicd(payload)
@@ -166,7 +192,7 @@ def run_phase2() -> None:
 
     # ------------------------------------------------------------------ GraphQL PRs
     print("\n[4c/5] Processing GraphQL PR records...")
-    gql_payloads = load_documents(store, "pr_graphql")
+    gql_payloads = load_documents(store, "pr_graphql", repo)
     print(f"  Found {len(gql_payloads)} GraphQL PR documents")
     for payload in gql_payloads:
         pg = parser.parse_pr_graphql(payload)
@@ -181,7 +207,7 @@ def run_phase2() -> None:
     # ------------------------------------------------------------------ Temporal graph
     print("\n[5/5] Building temporal graph...")
     # Load links stored in Phase 1
-    link_payloads = load_documents(store, "link")
+    link_payloads = load_documents(store, "link", repo)
     class _FakeLinkRecord:
         def __init__(self, p):
             self.source_type = p["source_type"]
@@ -213,9 +239,13 @@ def run_phase2() -> None:
 
     registry.close()
     graph_builder.close()
+    store.close()
 
 
 if __name__ == "__main__":
+    args_parser = argparse.ArgumentParser(description="Parse and chunk one ingested repository")
+    args_parser.add_argument("--repo", help="Repository identity; use 'legacy' only for old unscoped data")
+    args = args_parser.parse_args()
     t0 = time.time()
-    run_phase2()
+    run_phase2(args.repo)
     print(f"\n   Elapsed: {time.time() - t0:.1f}s")

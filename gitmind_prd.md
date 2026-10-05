@@ -25,7 +25,9 @@
 
 ## 1. Vision & Problem Statement
 
-GitMind is an intelligent codebase memory layer that transforms a repository's entire evolutionary history into a queryable knowledge base. It doesn't just search code — it understands **why** the code is the way it is, **who** shaped it, **what broke it**, and **what tradeoffs** were consciously made by the team over time.
+GitMind is a codebase memory layer. The target design makes selected current code searchable first. It then collects relevant history to help answer questions about why the code changed, who changed it, and which tradeoffs the team recorded. A full repository history is not required before users can ask questions.
+
+**Design status:** Selective file collection, current-code snapshots, incremental indexing, and history expansion on demand are planned work. The current Phase 1 implementation still uses a full clone by default and collects broad Git/GitHub records. Its resume checkpoints do not provide incremental code indexing. See the [ingestion design](docs/INGESTION_DESIGN.md) and [implementation plan](docs/IMPLEMENTATION_PLAN.md) for the current delivery phases and acceptance checks. The architecture and requirements below describe the target, not verified implementation status.
 
 ### The Core Problem
 
@@ -46,7 +48,7 @@ Every engineering team suffers from **institutional amnesia**:
 | Standard RAG on code | Semantic search over code files | Retrieves *what*, not *why* |
 | Confluence / Notion | Documentation | Manually written, always out of date, never comprehensive |
 
-GitMind closes this gap entirely by performing **temporally-aware, multi-hop retrieval across heterogeneous data sources** — commits, diffs, PRs, issues, and changelogs — to reconstruct institutional knowledge on demand.
+GitMind aims to reduce this gap through current-code retrieval and bounded retrieval across commits, diffs, PRs, issues, and changelogs. Answers must cite collected evidence and state coverage gaps. Missing records must not be treated as proof that an event or decision did not occur.
 
 ---
 
@@ -54,13 +56,13 @@ GitMind closes this gap entirely by performing **temporally-aware, multi-hop ret
 
 | User | Pain Point | What GitMind Gives Them |
 |---|---|---|
-| New engineer onboarding | No context on why things are built a certain way | 10 years of institutional knowledge on day 1 |
-| Senior engineer / tech lead | Spends hours in archaeology before refactors | Instant decision history for any module |
+| New engineer onboarding | No context on why things are built a certain way | Selected current code with relevant history when available |
+| Senior engineer / tech lead | Spends hours in archaeology before refactors | Scoped decision history with evidence and coverage limits |
 | Engineering manager | Needs to understand team velocity and churn patterns | Module risk maps, ownership timelines |
 | Open-source contributor | Doesn't understand why a design choice was made | PR + issue context surfaced alongside the code |
 | SRE / DevOps engineer | Needs to know what changed before an incident | Causality chains across deploys and commits |
 
-### Example Queries GitMind Can Answer
+### Target Queries (Subject to Source Coverage)
 
 - *"Why does the auth module use JWT instead of session cookies?"*
 - *"What broke every time someone touched the payments service?"*
@@ -76,7 +78,7 @@ GitMind closes this gap entirely by performing **temporally-aware, multi-hop ret
 This is not a chatbot over a codebase. The complexity lives in five distinct challenges that most RAG systems never face.
 
 ### 3.1 Heterogeneous Data Fusion
-You are simultaneously ingesting and linking: raw code files, git commit messages, git diffs (structured patches), PR titles + bodies + review comments, issue titles + body + labels + close reason, changelogs, and CI/CD failure logs. Each has a different schema, different semantic register, and a different relationship to time.
+The target supports selected code files, commit messages, diffs, PRs, issues, changelogs, and relevant CI records. Current code is collected first. Other sources are collected within a declared scope, as needed for a question or background task. Each source has a different schema and relationship to time.
 
 ### 3.2 Temporal Retrieval
 Standard RAG is stateless — it doesn't know that document A came before document B. GitMind must understand that a commit in March 2021 *caused* an issue opened in April 2021, which *caused* a PR merged in May 2021, which *introduced* a pattern still visible today. Retrieval must be temporally aware and causality-sensitive.
@@ -177,8 +179,8 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 
 | Component | Technology | Why |
 |---|---|---|
-| Git history extraction | `GitPython` | Full programmatic access to commits, diffs, branches, tags |
-| GitHub API (PRs, Issues) | `PyGitHub` + `httpx` | REST for structured data, async for bulk pulls |
+| Selected Git files and history | Git partial clone + sparse checkout where supported; `GitPython` for scoped history | Fetch selected files at a fixed commit; expand history within limits |
+| GitHub inventory and linked records | `PyGitHub` + `httpx` | Bounded API requests; detect truncated file listings and incomplete pages |
 | Diff parsing | `unidiff` | Parses unified diff format into structured hunks |
 | Code AST parsing | `tree-sitter` (Python bindings) | Language-aware code parsing for function/class extraction |
 | HTML/Markdown cleaning | `markdownify` + `BeautifulSoup4` | Clean issue/PR bodies from raw Markdown or HTML |
@@ -275,48 +277,42 @@ Git diffs are structured (old line / new line / file path / hunk). Issues have m
 
 ### 6.1 What Gets Ingested
 
-```
-Repository
-├── Git Commits
-│   ├── Hash, author, timestamp, message
-│   └── Full diff (parsed into file-level hunks)
-├── Pull Requests (via GitHub API)
-│   ├── Title, body, labels, state, merge status
-│   ├── Review comments (threaded)
-│   └── Linked issues (extracted from body + API)
-├── Issues (via GitHub API)
-│   ├── Title, body, labels, assignees, state
-│   ├── Comment thread
-│   └── Close reason / linked PR
-├── Releases / Tags
-│   ├── Tag name, timestamp
-│   └── Release notes body (Markdown)
-└── CHANGELOG.md (if present)
-    └── Parsed per-version sections
-```
+| Mode | Scope | When it runs |
+|---|---|---|
+| Current code | Selected source files, tests, docs, and configuration at a fixed commit | Default after implementation |
+| Selected history | Relevant commits, diffs, and linked PRs/issues; other evidence as needed | For a history question, within limits |
+| Full history | History within an explicit branch, path, and source scope | Optional background task with storage and time limits |
+
+Exclude secrets, dependencies, generated files, binaries, and build output by default. Show selected paths, excluded paths, and unsupported files. Full history means the declared scope; it does not mean every branch, private record, or inaccessible source.
 
 ### 6.2 Ingestion Flow
 
-```
-Step 1: Git Clone → extract all commits with diffs via GitPython
-Step 2: GitHub API pull → paginate all PRs, issues, reviews in parallel
-Step 3: Cross-reference linking → match commit SHA → PR, PR → issue
-Step 4: Entity extraction → run spaCy + tree-sitter over all documents
-Step 5: Entity normalization → build entity registry, resolve aliases
-Step 6: Temporal graph construction → build SQLite adjacency list
-Step 7: Per-document chunking → apply type-specific chunker
-Step 8: Embedding → batch embed all chunks, cache to disk
-Step 9: Index population → upsert into Qdrant + BM25 + FTS5
-Step 10: Checkpoint save → mark ingestion complete for this repo @ HEAD
-```
+1. Resolve the selected branch or tag to a fixed commit.
+2. List repository paths and apply include/exclude rules before file-content download.
+3. Fetch selected files. Reuse a local repository, or use partial clone with sparse checkout where supported. Use bounded file API requests as an alternative.
+4. Parse supported source files. Preserve file paths, symbols, and line ranges. Record unsupported files.
+5. Create chunks with stable content IDs and parser/chunker versions.
+6. Embed new or changed chunks in bounded batches. Reuse valid cached vectors.
+7. Build a consistent index generation across the document store, Qdrant, BM25, and FTS5. Publish it only after required checks pass.
+8. Save a coverage report with the commit, paths, skipped files, limits, errors, and index generation.
+
+A partial clone alone does not control cost. Reading all historical diffs can fetch large amounts of deferred content. File selection and history limits must apply to processing as well as transfer.
 
 ### 6.3 Incremental Re-ingestion
 
-On subsequent runs, GitMind checks the checkpoint and only ingests:
-- Commits after the last ingested SHA
-- PRs and issues updated after the last ingestion timestamp
+Compare the previous indexed snapshot with the new commit. Process added and changed files. Update renamed paths and remove deleted files from the active indexes. Reuse unchanged content and valid embeddings. Parser, chunker, or embedding-model changes must invalidate affected cache entries. A branch switch or force push requires a snapshot comparison; it must not rely only on a last-commit cursor.
 
-This makes re-ingestion fast for active repos.
+Readers must see one complete index generation during an update. A failed update must preserve the previous usable generation. Existing Phase 1 source checkpoints support collection resume only; these indexing guarantees still need implementation.
+
+### 6.4 History Expansion for Questions
+
+Route current-code questions to the selected snapshot. For history questions, identify relevant paths and symbols, including historical names when supplied. Fetch commits and linked discussions within explicit date, depth, document, byte, and time limits. Keep current-code evidence separate from historical versions. Cite the source commit or record. If the budget or source access prevents a complete answer, state the missing coverage.
+
+### 6.5 Limits and Acceptance Checks
+
+Configure file size, total bytes, document count, history depth, batch size, worker count, and task duration. Use bounded queues and resumable background jobs. Report readiness separately from coverage and answer confidence.
+
+Before making scale claims, measure transfer size, peak memory, elapsed time, and embedding calls on representative repositories. Verify that unchanged content causes no new embedding calls, excluded content is not fetched, deletions leave no active stale results, and a failed update preserves a usable index. Handle truncated provider listings explicitly. See [the detailed design and acceptance checks](docs/INGESTION_DESIGN.md). These settings describe requirements, not existing CLI flags.
 
 ---
 
@@ -351,13 +347,13 @@ Chunking is the most impactful design decision in the pipeline. GitMind uses **p
 
 ### 7.6 Chunk Metadata Schema
 
-Every chunk carries:
+Target metadata follows. These fields require implementation and validation:
 
 ```python
 @dataclass
 class ChunkMetadata:
-    chunk_id: str           # UUID
-    doc_type: str           # "commit" | "diff" | "pr" | "issue" | "release"
+    chunk_id: str           # Stable identity for this source version and chunk
+    doc_type: str           # "code" | "commit" | "diff" | "pr" | "issue" | "release"
     doc_id: str             # Commit SHA, PR number, issue number, etc.
     timestamp: datetime     # When this event happened in the repo
     author: str             # GitHub username or git author
@@ -366,7 +362,20 @@ class ChunkMetadata:
     graph_node_id: str      # ID in temporal graph
     file_paths: list[str]   # Files this chunk relates to (if applicable)
     repo: str               # Repo slug
+    source_commit: str | None  # Fixed commit for code/diff evidence
+    content_id: str          # Content hash for reuse
+    index_generation: str   # Consistent published index version
+    line_start: int | None  # Source line range, when applicable
+    line_end: int | None
+    symbol: str | None      # Function/class name, when available
+    parser_version: str
+    chunker_version: str
+    embedding_model_id: str # Include provider/model version in cache identity
 ```
+
+### 7.7 Current Code
+
+Split supported source files at function or class boundaries where practical. Use bounded splits for large symbols and plain-text fallback for selected unsupported formats. Preserve repository, commit, path, symbol, and line range for citations. Report parsing failures and unsupported syntax. Do not use historical diffs as a substitute for a current-code snapshot.
 
 ---
 
@@ -374,11 +383,9 @@ class ChunkMetadata:
 
 ### 8.1 Dual Embedding Strategy
 
-Each chunk gets embedded twice:
-- **Semantic embedding**: `nomic-embed-text` via Ollama (local, zero cost) for commit messages, issue text, PR bodies
-- **Code embedding**: `nomic-embed-code` via Ollama (local, zero cost) for diff chunks and code file chunks
+Embed only selected new or changed content when no valid cache entry exists. A semantic vector is required for each chunk in semantic search. A separate code vector is optional for supported code/diff chunks and must use a matching query model. Validate model availability and vector dimensions before use. Never insert a zero vector to report success after an embedding failure.
 
-Both vectors are stored in Qdrant as named vectors on the same point. Retrieval queries both and fuses results.
+The target uses Qdrant named vectors where appropriate. Keep provider and model versions separate in cache and index identity. Local embedding has compute, memory, and storage costs even when there is no API charge. Measure those costs before setting scale targets.
 
 ### 8.2 Qdrant Collection Schema
 
@@ -438,6 +445,8 @@ This enables fast exact-match + fuzzy entity resolution before semantic search.
 ## 9. Retrieval Layer
 
 ### 9.1 Query Processing Pipeline
+
+First choose the repository and snapshot. Route the question to current code or bounded history expansion as specified in Section 6.4. Apply the same repository, version, and access scope across every retrieval branch and graph expansion. Return coverage gaps with the answer. The following pipeline operates on that scoped evidence.
 
 ```
 Raw Query
@@ -658,112 +667,78 @@ with mlflow.start_run(run_name="hybrid_retrieval_v3"):
 
 ## 12. Project Phases & Execution Plan
 
-### Phase 1: Data Infrastructure (Week 1–2)
+Use the six delivery phases in [IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md). This replaces the earlier seven-phase weekly schedule. Dates and scale targets require measured effort and resource use. Existing component files do not establish acceptance.
 
-- [ ] Set up project repository with directory structure
-- [ ] Implement `GitCollector` using GitPython — pull all commits with diffs
-- [ ] Implement `GitHubAPICollector` — pull PRs, issues, review comments
-- [ ] Implement `CrossReferenceLinker` — link commits → PRs → issues
-- [ ] Build `DocumentStore` in SQLite using SQLModel
-- [ ] Implement ingestion checkpointing for resume capability
-- [ ] Write unit tests for all collectors
-- [ ] Test on FastAPI repository (manageable size, rich history)
+### Phase 1: Ingestion Foundation
 
-**Milestone**: All raw data for FastAPI repo ingested and stored in SQLite.
+Status: implemented foundation; verification is recorded in [PHASE1.md](docs/PHASE1.md).
 
----
+- Correct commit diffs and parent records.
+- Keep repository identities separate in stored documents.
+- Save source records and resume checkpoints in one transaction.
+- Report requested source scope, partial results, and collection errors.
 
-### Phase 2: Parsing, Entities & Chunking (Week 3–4)
+**Acceptance:** real Git, SQLite, and CLI checks plus the regression suite. Current full-clone behavior remains until Phase 2 changes it.
 
-- [ ] Implement `MultiSchemaParser` — per-type structured extraction
-- [ ] Integrate `unidiff` for structured diff parsing
-- [ ] Integrate `tree-sitter` for code entity extraction
-- [ ] Build `EntityExtractor` using spaCy
-- [ ] Build `EntityRegistry` with `rapidfuzz` for alias resolution
-- [ ] Implement `TemporalGraphBuilder` — construct SQLite adjacency list
-- [ ] Implement per-type chunkers (commit, diff, PR, issue, changelog)
-- [ ] Attach `ChunkMetadata` to every chunk
-- [ ] Write tests for chunking edge cases (empty diffs, giant PRs, etc.)
+### Phase 2: Selective Current Code and Incremental Indexing
 
-**Milestone**: All documents chunked with rich metadata. Entity graph built.
+Status: pending; next delivery phase.
 
----
+- **2A:** Pin a commit, list files, and apply path/type rules before fetching content. Add partial/sparse Git retrieval or bounded file API retrieval. Detect incomplete inventories.
+- Parse selected source, tests, docs, and configuration. Preserve paths, symbols, and line ranges for citations.
+- Normalize entities and create deterministic chunks with parser/chunker versions.
+- **2B:** Compare snapshots. Process additions and changes, update renames, and remove deleted content from active indices.
+- Reuse unchanged content and valid embeddings. Include provider/model identity in cache keys.
+- Validate vectors and prepare a consistent replacement generation across all indices.
+- Apply transfer, file-size, batch, and worker limits. Report scope and skipped content.
 
-### Phase 3: Embedding & Index (Week 5)
+**Acceptance:** exact source citations; no excluded content transfer; no new embedding calls for unchanged content; correct change/rename/delete handling; safe cache invalidation and index publication; measured transfer and peak memory.
 
-- [ ] Set up Qdrant in local persistence mode
-- [ ] Implement dual embedding pipeline (semantic + code vectors)
-- [ ] Implement `diskcache`-based embedding cache
-- [ ] Implement async batch embedder with rate limit handling
-- [ ] Build BM25 index using `bm25s`
-- [ ] Build SQLite FTS5 entity index
-- [ ] Upsert all chunks into all three indexes
-- [ ] Test retrieval sanity (basic keyword and semantic searches)
+### Phase 3: Scoped Retrieval and History Expansion
 
-**Milestone**: All chunks embedded and indexed. Basic retrieval working.
+Status: pending.
 
----
+- Enforce the same repository, snapshot, metadata, and access filters across dense, sparse, and graph retrieval.
+- Route current-code questions to the selected snapshot.
+- Expand relevant historical paths and linked PRs/issues only within declared budgets. Support explicit historical paths and deleted symbols.
+- Execute subqueries, load the reranker, and preserve evidenced temporal graph paths.
+- Keep current and historical versions separate. Report missing history and budget stops.
 
-### Phase 4: Retrieval Pipeline (Week 6–7)
+**Acceptance:** filter exclusion, current/history separation, chronological paths, expansion limits, and multi-hop cases. Compare answer quality with simpler retrieval baselines.
 
-- [ ] Implement `QueryDecomposer` using Gemini 2.0 Flash with JSON output
-- [ ] Implement `EntityResolver` using FTS5 index
-- [ ] Implement `HybridRetriever` with RRF fusion
-- [ ] Implement `TemporalGraphWalker`
-- [ ] Integrate cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`)
-- [ ] Implement `ContextAssembler` with `tiktoken` token budgeting
-- [ ] End-to-end retrieval test: complex multi-hop queries
-- [ ] Tune retrieval hyperparameters (top_k, graph_hop_depth, RRF k)
+### Phase 4: Answers, Citations, and Fallback
 
-**Milestone**: Full retrieval pipeline working. Multi-hop queries returning relevant context.
+Status: pending.
 
----
+- Validate direct answers, decision memos, ownership maps, and risk reports.
+- Check citations against retrieved source records and compute report statistics independently.
+- State when collected evidence cannot support an answer.
+- Verify Gemini-to-Ollama fallback, total outage behavior, and request time limits.
 
-### Phase 5: Generation & Output Modes (Week 8)
+**Acceptance:** reviewed known-answer and unsupported cases; valid schemas and citations; primary, fallback, and total-outage checks.
 
-- [ ] Build Jinja2 prompt templates for each answer mode
-- [ ] Implement `DirectQAGenerator`
-- [ ] Implement `DecisionMemoGenerator` with Pydantic structured output
-- [ ] Implement `BlameMapGenerator`
-- [ ] Implement `RiskReportGenerator`
-- [ ] Add Ollama fallback for local LLM usage
-- [ ] End-to-end demo on FastAPI repo: real questions, real answers
+### Phase 5: Evaluation and MLflow
 
-**Milestone**: All output modes working. Demo-ready on FastAPI.
+Status: pending.
 
----
+- Configure an explicit RAGAS judge and valid custom metrics.
+- Review held-out questions, including incorrect answers, temporal questions, and multi-hop questions.
+- Compare at least five configurations. Integrate experiment parameters, metrics, and artifacts with MLflow.
+- Publish reproducible results against PRD targets. Report coverage and resource costs with quality scores.
 
-### Phase 6: Evaluation (Week 9–10)
+**Acceptance:** incorrect answers receive lower scores; recorded runs reproduce the published evaluation. Targets remain claims to verify.
 
-- [ ] Build synthetic evaluation dataset (100 QA pairs) using Gemini 2.0 Flash
-- [ ] Include adversarial, temporal, and multi-hop question types
-- [ ] Set up RAGAS evaluation pipeline
-- [ ] Implement three custom RAGAS metrics
-- [ ] Run baseline evaluation (no reranker, no graph walk)
-- [ ] Run full pipeline evaluation
-- [ ] Set up MLflow experiment tracking
-- [ ] Log 5+ experiment configurations, compare metrics
-- [ ] Document findings: which components improve which metrics
-- [ ] Write evaluation report
+### Phase 6: Deployment and Background Collection
 
-**Milestone**: RAGAS evaluation complete with documented metric comparisons across configurations.
+Status: pending.
 
----
+- Verify FastAPI, Streamlit, and Docker from a clean installation.
+- Preserve data across restarts and support concurrent requests safely.
+- Show collection mode, selected paths, budgets, active commit, coverage, readiness, and task progress.
+- Add optional full-history background jobs with explicit scope, bounded queues, cancellation, and resume.
+- Measure transfer, memory, storage, duration, and embedding calls on a second repository.
 
-### Phase 7: Interface & Polish (Week 11)
-
-- [ ] Build Streamlit interface with:
-  - Repo ingestion form
-  - Query input with answer mode selector
-  - Answer display with expandable evidence chain
-  - Timeline visualization of retrieved documents
-  - Module selector for Blame Map and Risk Report
-- [ ] Build `Typer` CLI for ingestion and batch querying
-- [ ] Write comprehensive README with demo GIF
-- [ ] Add second repo: Django or CPython subsystem
-- [ ] Final end-to-end demo pass
-
-**Milestone**: Project demo-ready for interviews and GitHub showcase.
+**Acceptance:** clean deployment, durable state, visible failures, safe concurrency, and background jobs that respect measured resource limits. Production readiness requires the applicable checks from all six phases.
 
 ---
 
@@ -890,8 +865,10 @@ gitmind/
 
 ## 15. Resume One-Liner
 
-> *"Built GitMind, an LLM-powered codebase archaeology system performing multi-hop, temporally-aware retrieval across git history, PRs, and issue threads using hybrid dense-sparse retrieval with cross-encoder reranking, evaluated end-to-end with RAGAS and custom temporal accuracy metrics."*
+Current scope; revise only after acceptance evidence supports stronger claims:
+
+> Built GitMind, a repository Q&A prototype with Git/GitHub ingestion and tested collection resume. Designed selective current-code indexing, incremental updates, and bounded history retrieval; these improvements and production evaluation remain in progress.
 
 ---
 
-*Document version: 1.1 | Project: GitMind | Status: Phase 2 complete | Embedding: nomic-embed-text/code (Ollama) | LLM: Gemini 2.0 Flash*
+*Document version: 1.2 | Project: GitMind | Status: Phase 1 foundation implemented; selective ingestion and incremental indexing planned | Delivery status: docs/IMPLEMENTATION_PLAN.md*
