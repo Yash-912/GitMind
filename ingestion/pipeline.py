@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
+import re
 from types import SimpleNamespace
 import uuid
 
@@ -16,6 +17,63 @@ from .git_collector import GitCollector
 from .github_collector import GitHubAPICollector
 
 
+def _closing_numbers(record: dict) -> list[int]:
+    numbers = record.get("closing_issue_numbers")
+    if numbers is None:  # payload stored before structured numbers existed
+        numbers = [
+            int(m)
+            for text in record.get("closing_issues", [])
+            for m in re.findall(r"^#(\d+)", text)
+        ]
+    return [int(n) for n in numbers]
+
+
+def merge_graphql_into_prs(store: DocumentStore, repo_id: str) -> dict:
+    """Copy GraphQL closing references onto the canonical stored PR records.
+
+    Returns counts; PRs absent from the REST collection are reported unmatched
+    (their links are still emitted against pr_<n>).
+    """
+    prs = {str(p["number"]): p for p in store.get_documents("pr", repo_id)}
+    merged = unmatched = 0
+    updated = []
+    for g in store.get_documents("pr_graphql", repo_id):
+        pr = prs.get(str(g["number"]))
+        if pr is None:
+            unmatched += 1
+            continue
+        updated.append(
+            {
+                **pr,
+                "closing_issue_numbers": _closing_numbers(g),
+                "closing_issues": g.get("closing_issues", []),
+                "closing_issues_complete": g.get("closing_issues_complete", True),
+                "closing_source": "graphql",
+            }
+        )
+        merged += 1
+    store.upsert_many("pr", updated, id_key="number", repo=repo_id)
+    return {"merged_into_prs": merged, "unmatched_prs": unmatched}
+
+
+def record_sync_failure(store: DocumentStore, repo_id: str, error: Exception) -> dict:
+    """Persist a failed manifest when the clone could not be brought up to date."""
+    manifest_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    manifest = {
+        "run_id": manifest_id,
+        "repo": repo_id,
+        "status": "failed",
+        "started_at": now,
+        "finished_at": now,
+        "error_type": type(error).__name__,
+        "repo_sync": {"mode": "managed_clone", "fetch": "failed"},
+        "sources": {"git": {"status": "not_collected"}},
+    }
+    store.upsert_document("ingestion_manifest", manifest_id, manifest, repo=repo_id)
+    return manifest
+
+
 def ingest_repository(
     store: DocumentStore,
     collector: GitCollector,
@@ -26,6 +84,7 @@ def ingest_repository(
     refresh: bool = False,
     workflow_limit: int | None = None,
     graphql_limit: int | None = None,
+    repo_sync: dict | None = None,
 ) -> dict:
     manifest_id = str(uuid.uuid4())
     manifest = {
@@ -33,6 +92,7 @@ def ingest_repository(
         "repo": repo_id,
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "repo_sync": repo_sync or {"mode": "local", "fetch": "not_requested"},
         "sources": {},
     }
     store.upsert_document("ingestion_manifest", manifest_id, manifest, repo=repo_id)
@@ -88,6 +148,11 @@ def ingest_repository(
             "unavailable_diffs": unavailable,
             "shallow": collector.is_shallow,
             "limit": max_commits,
+            "pinned_sha": (
+                collector.repo.head.commit.hexsha
+                if collector.repo.head.is_valid()
+                else None
+            ),
         }
         store.upsert_document("ingestion_manifest", manifest_id, manifest, repo=repo_id)
         if github:
@@ -155,6 +220,10 @@ def ingest_repository(
                     "limit": limit,
                     "truncated_closing_issue_lists": truncated_links,
                 }
+                if doc_type == "pr_graphql":
+                    manifest["sources"][doc_type].update(
+                        merge_graphql_into_prs(store, repo_id)
+                    )
                 store.upsert_document(
                     "ingestion_manifest", manifest_id, manifest, repo=repo_id
                 )
@@ -166,12 +235,23 @@ def ingest_repository(
         prs = [SimpleNamespace(**c) for c in store.get_documents("pr", repo_id)]
         issues = [SimpleNamespace(**c) for c in store.get_documents("issue", repo_id)]
         linker = CrossReferenceLinker()
+        graphql_prs = [
+            SimpleNamespace(
+                number=g["number"],
+                closing_issue_numbers=_closing_numbers(g),
+                closing_issues_complete=g.get("closing_issues_complete", True),
+            )
+            for g in store.get_documents("pr_graphql", repo_id)
+        ]
         links = (
             linker.link_commit_parents(commits)
             + linker.link_commits_to_prs(commits, prs)
             + linker.link_prs_to_issues(prs, issues)
             + linker.link_commits_to_issues(commits, issues)
+            + linker.link_prs_to_closing_issues(graphql_prs)
         )
+        # GraphQL is authoritative: it replaces a text-derived link of the same id.
+        links = list({link.link_id: link for link in links}.values())
         store.upsert_many(
             "link", (asdict(link) for link in links), id_key="link_id", repo=repo_id
         )

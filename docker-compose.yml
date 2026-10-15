@@ -12,7 +12,7 @@ version: "3.9"
 services:
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.15.0
     container_name: gitmind-qdrant
     ports:
       - "6333:6333"   # REST API
@@ -28,9 +28,9 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Remote Qdrant (the service above)
+      # Remote Qdrant (the service above). A URL selects remote mode; the API
+      # key is optional and unused by this unauthenticated local service.
       QDRANT_URL: http://qdrant:6333
-      QDRANT_API_KEY: ""
       # SQLite for local dev (no Postgres needed)
       DATABASE_URL: ""
       DB_PATH: data/gitmind.db

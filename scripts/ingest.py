@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import settings
 from ingestion import DocumentStore, GitCollector, GitHubAPICollector
-from ingestion.pipeline import ingest_repository
+from ingestion.pipeline import ingest_repository, record_sync_failure
 from ingestion.repository import (
     clone_github_repository,
     normalize_github_repo,
@@ -47,6 +47,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--history", choices=["full", "shallow"], default="full")
     parser.add_argument("--clone-depth", type=positive, default=500)
+    parser.add_argument(
+        "--ref",
+        help="Branch to fetch and fast-forward in a managed clone (default: checked-out branch)",
+    )
     parser.add_argument("--allow-incomplete-history", action="store_true")
     parser.add_argument(
         "--refresh",
@@ -71,16 +75,34 @@ def main() -> None:
         else (settings.github_repo if not args.repo_path else None)
     )
     github_repo = normalize_github_repo(repo_input) if repo_input else None
+    repo_sync = None  # local --repo-path / cwd mode never fetches
     if args.repo_path:
         repo_path = Path(args.repo_path)
     elif github_repo:
-        repo_path = clone_github_repository(
-            github_repo,
-            Path(settings.data_dir) / "repos" / github_repo.replace("/", "_"),
-            history=args.history,
-            depth=args.clone_depth,
-            token=args.github_token,
-        )
+        managed = Path(settings.data_dir) / "repos" / github_repo.replace("/", "_")
+        existed = managed.exists()
+        try:
+            repo_path = clone_github_repository(
+                github_repo,
+                managed,
+                history=args.history,
+                depth=args.clone_depth,
+                token=args.github_token,
+                ref=args.ref,
+            )
+        except RuntimeError as exc:
+            Path(args.db_path).parent.mkdir(parents=True, exist_ok=True)
+            failed_store = DocumentStore(args.db_path)
+            try:
+                record_sync_failure(failed_store, github_repo, exc)
+            finally:
+                failed_store.close()
+            raise
+        repo_sync = {
+            "mode": "managed_clone",
+            "fetch": "ok" if existed else "fresh_clone",
+            "ref": args.ref,
+        }
     else:
         repo_path = Path(".")
     collector = GitCollector(
@@ -108,6 +130,7 @@ def main() -> None:
             refresh=args.refresh,
             workflow_limit=args.workflow_limit,
             graphql_limit=args.graphql_limit,
+            repo_sync=repo_sync,
         )
         changelog_path = repo_path / "CHANGELOG.md"
         if changelog_path.exists():

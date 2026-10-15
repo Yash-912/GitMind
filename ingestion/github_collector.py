@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import time
 from typing import Iterable
@@ -8,6 +8,26 @@ from typing import Iterable
 from github import Github
 from github.GithubException import GithubException
 import httpx
+
+
+@dataclass(frozen=True)
+class CommentRecord:
+    """One discussion comment with its own identity, author, time and URL.
+
+    ``thread_id`` groups a review thread (root comment id); ``parent_id`` is the
+    comment replied to (None for a root / flat issue comment).
+    """
+
+    comment_id: int
+    kind: str  # "issue_comment" | "review_comment"
+    author: str
+    created_at: str
+    updated_at: str
+    url: str
+    body: str
+    parent_id: int | None = None
+    thread_id: int | None = None
+    path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +44,13 @@ class PullRequestRecord:
     merge_commit_sha: str | None
     labels: list[str]
     review_comments: list[str]
+    # Added fields default so payloads stored before them still load.
+    url: str = ""
+    review_comment_records: list[CommentRecord] = field(default_factory=list)
+    closing_issue_numbers: list[int] = field(default_factory=list)
+    closing_issues: list[str] = field(default_factory=list)
+    closing_issues_complete: bool | None = None  # None: GraphQL not merged
+    closing_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +65,8 @@ class IssueRecord:
     closed_at: str | None
     labels: list[str]
     comments: list[str]
+    url: str = ""
+    comment_records: list[CommentRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -73,12 +102,30 @@ class GraphQLPRRecord:
     merged_at: str | None
     closing_issues: list[str]
     closing_issues_complete: bool = True
+    closing_issue_numbers: list[int] = field(default_factory=list)
 
 
 def _dt(dt: datetime | None) -> str | None:
     if dt is None:
         return None
     return dt.isoformat()
+
+
+def _comment_record(c, kind: str) -> CommentRecord:
+    parent = getattr(c, "in_reply_to_id", None) if kind == "review_comment" else None
+    cid = int(c.id)
+    return CommentRecord(
+        comment_id=cid,
+        kind=kind,
+        author=c.user.login if getattr(c, "user", None) else "",
+        created_at=_dt(c.created_at) or "",
+        updated_at=_dt(c.updated_at) or "",
+        url=getattr(c, "html_url", "") or "",
+        body=c.body or "",
+        parent_id=int(parent) if parent else None,
+        thread_id=(int(parent) if parent else cid) if kind == "review_comment" else None,
+        path=getattr(c, "path", None) if kind == "review_comment" else None,
+    )
 
 
 def _utc(dt: datetime) -> datetime:
@@ -138,7 +185,9 @@ class GitHubAPICollector:
             if cutoff and _utc(pr.updated_at) < cutoff:
                 continue
             labels = [label.name for label in pr.labels]
-            review_comments = [c.body or "" for c in pr.get_review_comments()]
+            review_records = [
+                _comment_record(c, "review_comment") for c in pr.get_review_comments()
+            ]
             yield PullRequestRecord(
                 number=pr.number,
                 title=pr.title or "",
@@ -151,7 +200,9 @@ class GitHubAPICollector:
                 merged_at=_dt(pr.merged_at),
                 merge_commit_sha=pr.merge_commit_sha,
                 labels=labels,
-                review_comments=review_comments,
+                review_comments=[c.body for c in review_records],
+                url=getattr(pr, "html_url", "") or "",
+                review_comment_records=review_records,
             )
 
     def iter_issues(
@@ -170,7 +221,9 @@ class GitHubAPICollector:
             if cutoff and _utc(issue.updated_at) < cutoff:
                 continue
             labels = [label.name for label in issue.labels]
-            comments = [c.body or "" for c in issue.get_comments()]
+            comment_records = [
+                _comment_record(c, "issue_comment") for c in issue.get_comments()
+            ]
             yield IssueRecord(
                 number=issue.number,
                 title=issue.title or "",
@@ -181,7 +234,9 @@ class GitHubAPICollector:
                 updated_at=_dt(issue.updated_at) or "",
                 closed_at=_dt(issue.closed_at),
                 labels=labels,
-                comments=comments,
+                comments=[c.body for c in comment_records],
+                url=getattr(issue, "html_url", "") or "",
+                comment_records=comment_records,
             )
 
     def collect_pull_requests(
@@ -317,6 +372,9 @@ class GitHubAPICollector:
                 for pr in connection["nodes"]:
                     issues = pr.get("closingIssuesReferences", {}).get("nodes", [])
                     closing = [f"#{i.get('number')}: {i.get('title')}" for i in issues]
+                    closing_numbers = [
+                        int(i["number"]) for i in issues if i.get("number") is not None
+                    ]
                     records.append(
                         GraphQLPRRecord(
                             number=int(pr.get("number", 0)),
@@ -326,6 +384,7 @@ class GitHubAPICollector:
                             created_at=pr.get("createdAt"),
                             merged_at=pr.get("mergedAt"),
                             closing_issues=closing,
+                            closing_issue_numbers=closing_numbers,
                             closing_issues_complete=not pr.get(
                                 "closingIssuesReferences", {}
                             )

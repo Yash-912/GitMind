@@ -44,8 +44,9 @@ def _chunk_id_to_uuid(chunk_id: str) -> str:
 class QdrantStore:
     """Manages a Qdrant collection with named vectors: 'semantic' + 'code'.
 
-    Connects to Qdrant Cloud when QDRANT_URL + QDRANT_API_KEY are configured,
-    otherwise falls back to a local on-disk mode for development.
+    Connects to a remote Qdrant (Cloud or a local docker service) whenever
+    QDRANT_URL is configured; QDRANT_API_KEY is optional. Local on-disk mode is
+    used only when no URL is set.
     """
 
     def __init__(
@@ -60,11 +61,11 @@ class QdrantStore:
         self.code_dim = code_dim
 
         from config.settings import settings as _s
-        if _s.qdrant_url and _s.qdrant_api_key:
-            # Production: connect to Qdrant Cloud
+        if _s.qdrant_url:
+            # Remote service; the API key is optional (e.g. unauthenticated docker).
             self.client = QdrantClient(
                 url=_s.qdrant_url,
-                api_key=_s.qdrant_api_key,
+                api_key=_s.qdrant_api_key or None,
             )
         else:
             # Development: local on-disk storage

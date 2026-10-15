@@ -16,6 +16,9 @@ class LinkRecord:
     target_type: str
     target_id: str
     relation: str
+    # Provenance; defaults keep links stored before these fields loadable.
+    source: str = ""
+    source_complete: bool = True
 
 
 def _link_id(
@@ -68,6 +71,32 @@ class CrossReferenceLinker:
                                 "closes",
                             )
                         )
+        return links
+
+    def link_prs_to_closing_issues(self, graphql_prs: Iterable) -> list[LinkRecord]:
+        """Canonical pr_<n> -> issue closes links from GraphQL closing references.
+
+        ``source_complete`` is False when GitHub truncated the reference list.
+        """
+        links: list[LinkRecord] = []
+        for pr in graphql_prs:
+            numbers = getattr(pr, "closing_issue_numbers", None)
+            if numbers is None:
+                numbers = []
+            complete = bool(getattr(pr, "closing_issues_complete", True))
+            for issue_id in dict.fromkeys(str(n) for n in numbers):
+                links.append(
+                    LinkRecord(
+                        _link_id("pr", str(pr.number), "issue", issue_id, "closes"),
+                        "pr",
+                        str(pr.number),
+                        "issue",
+                        issue_id,
+                        "closes",
+                        source="graphql",
+                        source_complete=complete,
+                    )
+                )
         return links
 
     def link_commit_parents(self, commits: Iterable[CommitRecord]) -> list[LinkRecord]:
