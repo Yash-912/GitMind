@@ -1,13 +1,26 @@
-"""embedding_cache.py — diskcache wrapper to avoid re-embedding unchanged chunks."""
+"""embedding_cache.py — diskcache wrapper to avoid re-embedding unchanged chunks.
+
+Keys are namespaced by the *actual* ``EmbeddingIdentity`` (provider, model,
+dim) that produced the vector, never by the requested model name.  Only
+validated vectors are stored, and entries are re-validated on read so that a
+poisoned entry (zeros, wrong dimension, other identity) is treated as a miss.
+
+The legacy ``model: str`` API is kept for plain-string keys; DualEmbedder uses
+the identity API.  Legacy entries live under a different key namespace and are
+never returned for identity lookups (so previously cached zero vectors from the
+old fallback can no longer be reused).
+"""
 from __future__ import annotations
 
 import hashlib
 import json
 from pathlib import Path
 
+from .models import EmbeddingIdentity, InvalidEmbeddingError, validate_vector
+
 
 class EmbeddingCache:
-    """Persistent on-disk cache mapping (text_hash, model) → embedding vector.
+    """Persistent on-disk cache mapping (text_hash, identity) → embedding vector.
 
     Uses ``diskcache`` for efficient disk-backed storage.  Falls back to
     a simple JSON file when diskcache is not installed.
@@ -31,33 +44,48 @@ class EmbeddingCache:
             return {}
 
     @staticmethod
-    def _key(text: str, model: str) -> str:
-        """Deterministic cache key from text content + model name."""
-        h = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-        return f"{model}:{h}"
+    def _key(text: str, model: "str | EmbeddingIdentity") -> str:
+        """Deterministic cache key from text content + model name or identity."""
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        if isinstance(model, EmbeddingIdentity):
+            return f"v2:{model.key}:{digest}"
+        return f"{model}:{digest[:16]}"
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def get(self, text: str, model: str) -> list[float] | None:
-        """Return cached vector or None."""
+    def get(self, text: str, model: "str | EmbeddingIdentity") -> list[float] | None:
+        """Return cached vector or None (invalid/poisoned entries are misses)."""
         key = self._key(text, model)
         try:
             val = self._cache[key]  # works for both diskcache.Cache and dict
-            return val
         except (KeyError, TypeError):
             return None
+        if not isinstance(model, EmbeddingIdentity):
+            return val
+        try:
+            stored = EmbeddingIdentity.from_dict(val["identity"])
+            if not stored.matches(model):
+                return None
+            return validate_vector(val["vector"], model.dim)
+        except (KeyError, TypeError, ValueError, InvalidEmbeddingError):
+            return None
 
-    def put(self, text: str, model: str, vector: list[float]) -> None:
-        """Store a vector in the cache."""
+    def put(self, text: str, model: "str | EmbeddingIdentity", vector: list[float]) -> None:
+        """Store a vector.  With an identity the vector is validated first and
+        InvalidEmbeddingError is raised instead of caching a bad result."""
         key = self._key(text, model)
-        self._cache[key] = vector
+        if isinstance(model, EmbeddingIdentity):
+            vector = validate_vector(vector, model.dim)
+            self._cache[key] = {"identity": model.to_dict(), "vector": vector}
+        else:
+            self._cache[key] = vector
 
     def get_or_compute(
         self,
         text: str,
-        model: str,
+        model: "str | EmbeddingIdentity",
         compute_fn,
     ) -> list[float]:
         """Return cached vector, or call compute_fn(text) and cache the result."""
@@ -69,7 +97,7 @@ class EmbeddingCache:
         return vector
 
     def batch_get(
-        self, texts: list[str], model: str
+        self, texts: list[str], model: "str | EmbeddingIdentity"
     ) -> tuple[list[list[float] | None], list[int]]:
         """Check cache for a batch. Returns (results, miss_indices).
 
@@ -86,11 +114,15 @@ class EmbeddingCache:
         return results, miss_indices
 
     def batch_put(
-        self, texts: list[str], model: str, vectors: list[list[float]]
+        self,
+        texts: list[str],
+        model: "str | EmbeddingIdentity",
+        vectors: "list[list[float] | None]",
     ) -> None:
-        """Store multiple vectors at once."""
+        """Store multiple vectors at once; None entries (failures) are skipped."""
         for text, vec in zip(texts, vectors):
-            self.put(text, model, vec)
+            if vec is not None:
+                self.put(text, model, vec)
 
     @property
     def size(self) -> int:

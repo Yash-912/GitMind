@@ -75,33 +75,36 @@ class TestEmbeddingCache:
 # OllamaEmbeddingClient (mocked)
 # =====================================================================
 
+def _fake_ollama_http():
+    """Offline httpx client emulating Ollama's /api/tags and /api/embed."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "nomic-embed-text:latest"}]})
+        if request.url.path == "/api/embed":
+            n = len(json.loads(request.content)["input"])
+            return httpx.Response(200, json={"embeddings": [[0.1 * (i + 1)] * 768 for i in range(n)]})
+        return httpx.Response(404)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
 class TestOllamaEmbeddingClient:
     def setup_method(self):
         from embedding.models import OllamaEmbeddingClient
-        self.client = OllamaEmbeddingClient()
+        self.client = OllamaEmbeddingClient(
+            http_client=_fake_ollama_http(), provider_order=["ollama"]
+        )
 
     def test_embed_single_mocked(self):
-        fake_response = MagicMock()
-        fake_response.status_code = 200
-        fake_response.json.return_value = {"embedding": [0.1] * 768}
-        fake_response.raise_for_status = MagicMock()
-
-        with patch.object(self.client._client, "post", return_value=fake_response):
-            vec = self.client.embed_single("test text")
-            assert len(vec) == 768
+        vec = self.client.embed_single("test text")
+        assert len(vec) == 768
 
     def test_embed_batch_mocked(self):
-        fake_response = MagicMock()
-        fake_response.status_code = 200
-        fake_response.json.return_value = {
-            "embeddings": [[0.1] * 768, [0.2] * 768]
-        }
-        fake_response.raise_for_status = MagicMock()
-
-        with patch.object(self.client._client, "post", return_value=fake_response):
-            vecs = self.client.embed_batch(["text1", "text2"])
-            assert len(vecs) == 2
-            assert len(vecs[0]) == 768
+        vecs = self.client.embed_batch(["text1", "text2"])
+        assert len(vecs) == 2
+        assert len(vecs[0]) == 768
 
 
 # =====================================================================
@@ -115,12 +118,11 @@ class TestDualEmbedder:
         from embedding.embedding_cache import EmbeddingCache
         from embedding.embedder import DualEmbedder
 
-        self.mock_client = MagicMock(spec=OllamaEmbeddingClient)
-        self.mock_client.embed_batch.return_value = [[0.5] * 768]
-        self.cache = EmbeddingCache(cache_dir=self._tmpdir)
-        self.embedder = DualEmbedder(
-            client=self.mock_client, cache=self.cache
+        self.client = OllamaEmbeddingClient(
+            http_client=_fake_ollama_http(), provider_order=["ollama"]
         )
+        self.cache = EmbeddingCache(cache_dir=self._tmpdir)
+        self.embedder = DualEmbedder(client=self.client, cache=self.cache)
 
     def teardown_method(self):
         self.embedder.close()
@@ -140,20 +142,42 @@ class TestDualEmbedder:
 
     def test_prose_only_chunk(self):
         chunks = self._make_chunks(["commit"])
-        # Mock returns a vector for each text
-        self.mock_client.embed_batch.return_value = [[0.5] * 768]
         results = self.embedder.embed_chunks(chunks, show_progress=False)
         assert len(results) == 1
         assert results[0].semantic_vector is not None
         assert results[0].code_vector is None
 
-    def test_diff_gets_both_vectors(self):
+    def test_diff_without_distinct_code_model_gets_semantic_only(self):
+        # Default config: CODE_MODEL == PROSE_MODEL, so no separate code vector.
         chunks = self._make_chunks(["diff"])
-        self.mock_client.embed_batch.return_value = [[0.5] * 768]
         results = self.embedder.embed_chunks(chunks, show_progress=False)
         assert len(results) == 1
         assert results[0].semantic_vector is not None
+        assert results[0].code_vector is None
+
+    def test_diff_gets_both_vectors_with_distinct_code_model(self):
+        import httpx
+        from embedding.models import OllamaEmbeddingClient
+        from embedding.embedder import DualEmbedder
+
+        def handler(request):
+            if request.url.path == "/api/tags":
+                return httpx.Response(200, json={"models": [
+                    {"name": "nomic-embed-text:latest"}, {"name": "code-embed:latest"}]})
+            n = len(json.loads(request.content)["input"])
+            return httpx.Response(200, json={"embeddings": [[0.5] * 768] * n})
+
+        client = OllamaEmbeddingClient(
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            provider_order=["ollama"],
+        )
+        embedder = DualEmbedder(
+            client=client, cache=self.cache, code_model="code-embed"
+        )
+        results = embedder.embed_chunks(self._make_chunks(["diff"]), show_progress=False)
+        assert results[0].semantic_vector is not None
         assert results[0].code_vector is not None
+        assert results[0].code_identity.model == "code-embed"
 
     def test_empty_chunks(self):
         results = self.embedder.embed_chunks([], show_progress=False)

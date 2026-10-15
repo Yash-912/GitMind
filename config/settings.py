@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     bm25_index_dir: str = "data/bm25_index"
     embedding_cache_dir: str = "data/.diskcache/embeddings"
 
+    # Embedding models.  The code model defaults to the SAME model as the prose
+    # model, i.e. there is no distinct code embedding unless you set
+    # EMBEDDING_CODE_MODEL (and EMBEDDING_CODE_DIM) to a different model.
+    embedding_prose_model: str = "nomic-embed-text"
+    embedding_code_model: str = "nomic-embed-text"
+    embedding_prose_dim: int = 768
+    embedding_code_dim: int = 768
+    # "auto" = Ollama, then Gemini if GEMINI_API_KEY is set; or "ollama" / "gemini".
+    embedding_provider: str = "auto"
+    embedding_gemini_model: str = "gemini-embedding-2"
+
     # Phase 5 — Generation (Gemini)
     gemini_api_key: str | None = None
 
