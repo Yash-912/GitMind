@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import inspect
 from collections import defaultdict
-from typing import Any
+from typing import Any, Iterable
 
 from indexing.qdrant_store import QdrantStore
 from indexing.bm25_index import BM25Index
@@ -11,9 +12,19 @@ from .types import CandidateChunk
 from .chunk_store import ChunkStore
 from .query_embedder import QueryEmbedder
 
+PERSON_BOOST = 1.15
+
 
 class HybridRetriever:
-    """Combine dense, sparse, and FTS retrieval with RRF fusion."""
+    """Combine dense, sparse, and FTS retrieval with RRF fusion.
+
+    With a ``scope`` the same scope constrains every branch: allowed chunk ids
+    (computed once per scope and cached) are passed to BM25/FTS, a Qdrant
+    filter is built from the scope, and after fusion every candidate is
+    re-checked with ``scope.matches`` so a branch that ignores its filter can
+    never leak an out-of-scope chunk. Without a scope the legacy ``filters``
+    dict behaviour is unchanged.
+    """
 
     def __init__(
         self,
@@ -39,76 +50,132 @@ class HybridRetriever:
             "bm25": 0.7,
             "fts": 0.6,
         }
+        self._allowed_cache: dict[Any, frozenset[str]] = {}
+
+    # ------------------------------------------------------------------ scope
+
+    def allowed_ids_for(self, scope: Any) -> frozenset[str]:
+        """Chunk ids satisfying `scope`; computed once per scope."""
+        try:
+            return self._allowed_cache[scope]
+        except KeyError:
+            ids = frozenset(scope.filter_ids(self.chunk_store.records()))
+            self._allowed_cache[scope] = ids
+            return ids
+
+    def _scope_filter(self, scope: Any) -> Any:
+        build = getattr(self.qdrant, "build_filter", None)
+        if build is None:
+            return None
+        try:
+            params = list(inspect.signature(build).parameters)
+        except (TypeError, ValueError):
+            params = []
+        if params and params[0] == "scope":
+            return build(scope)
+        # Legacy keyword builder: cannot express repo/kind/commit or several
+        # authors, so the post-fusion scope check enforces those.
+        return build(
+            doc_types=list(scope.doc_types) or None,
+            module_tags=list(scope.modules) or None,
+            author=scope.authors[0] if len(scope.authors) == 1 else None,
+            time_start=scope.time_start,
+            time_end=scope.time_end,
+        )
+
+    # --------------------------------------------------------------- retrieve
 
     def retrieve(
         self,
         query: str,
         limit: int = 40,
         filters: dict[str, Any] | None = None,
+        scope: Any = None,
+        allowed_ids: Iterable[str] | None = None,
+        doc_type_weights: dict[str, float] | None = None,
+        boost_terms: Iterable[str] = (),
     ) -> list[CandidateChunk]:
-        query_vector = self.embedder.embed(query)
-        q_filter = QdrantStore.build_filter(
-            doc_types=filters.get("doc_types") if filters else None,
-            module_tags=filters.get("module_tags") if filters else None,
-            author=filters.get("author") if filters else None,
-            time_start=filters.get("time_start") if filters else None,
-            time_end=filters.get("time_end") if filters else None,
+        return self.retrieve_many(
+            [query], limit, filters, scope, allowed_ids, doc_type_weights, boost_terms
         )
 
-        dense_results = self.qdrant.search_semantic(
-            query_vector=query_vector,
-            limit=limit,
-            query_filter=q_filter,
-        )
-        code_results = []
-        if self.use_code_search and hasattr(self.qdrant, "search_code"):
-            code_results = self.qdrant.search_code(
-                query_vector=query_vector,
-                limit=limit,
-                query_filter=q_filter,
+    def retrieve_many(
+        self,
+        queries: Iterable[str],
+        limit: int = 40,
+        filters: dict[str, Any] | None = None,
+        scope: Any = None,
+        allowed_ids: Iterable[str] | None = None,
+        doc_type_weights: dict[str, float] | None = None,
+        boost_terms: Iterable[str] = (),
+    ) -> list[CandidateChunk]:
+        """Retrieve every query separately (same scope) and RRF-fuse all branch lists."""
+        allowed: frozenset[str] | None = None
+        if scope is not None:
+            allowed = frozenset(allowed_ids) if allowed_ids is not None else self.allowed_ids_for(scope)
+            if not allowed:
+                return []
+            q_filter = self._scope_filter(scope)
+        else:
+            q_filter = QdrantStore.build_filter(
+                doc_types=filters.get("doc_types") if filters else None,
+                module_tags=filters.get("module_tags") if filters else None,
+                author=filters.get("author") if filters else None,
+                time_start=filters.get("time_start") if filters else None,
+                time_end=filters.get("time_end") if filters else None,
             )
-        bm25_results = self.bm25.search(query, limit=limit)
-        fts_results = self.fts.search(query, limit=limit)
+        id_kwargs = {"allowed_ids": allowed} if allowed is not None else {}
+
+        branch_lists: list[tuple[str, list[Any]]] = []
+        for query in dict.fromkeys(q for q in queries if q and q.strip()):
+            vec = self.embedder.embed(query)  # typed EmbeddingError propagates
+            branch_lists.append(
+                ("qdrant_semantic",
+                 self.qdrant.search_semantic(query_vector=vec, limit=limit, query_filter=q_filter))
+            )
+            if self.use_code_search and hasattr(self.qdrant, "search_code"):
+                branch_lists.append(
+                    ("qdrant_code",
+                     self.qdrant.search_code(query_vector=vec, limit=limit, query_filter=q_filter))
+                )
+            branch_lists.append(("bm25", self.bm25.search(query, limit=limit, **id_kwargs)))
+            branch_lists.append(("fts", self.fts.search(query, limit=limit, **id_kwargs)))
 
         scores: dict[str, float] = defaultdict(float)
         sources: dict[str, str] = {}
+        for source, results in branch_lists:
+            w = self.source_weights.get(source, 1.0)
+            for rank, r in enumerate(results):
+                scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
+                sources.setdefault(r.chunk_id, source)
 
-        for rank, r in enumerate(dense_results):
-            w = self.source_weights.get("qdrant_semantic", 1.0)
-            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
-            sources.setdefault(r.chunk_id, "qdrant_semantic")
-
-        for rank, r in enumerate(code_results):
-            w = self.source_weights.get("qdrant_code", 1.0)
-            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
-            sources.setdefault(r.chunk_id, "qdrant_code")
-
-        for rank, r in enumerate(bm25_results):
-            w = self.source_weights.get("bm25", 0.7)
-            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
-            sources.setdefault(r.chunk_id, "bm25")
-
-        for rank, r in enumerate(fts_results):
-            w = self.source_weights.get("fts", 0.6)
-            scores[r.chunk_id] += w / (self.rrf_k + rank + 1)
-            sources.setdefault(r.chunk_id, "fts")
-
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+        boosts = [t.lower() for t in boost_terms if t]
+        weights = doc_type_weights or {}
         candidates: list[CandidateChunk] = []
-        for chunk_id, score in ranked:
+        for chunk_id, score in scores.items():
             record = self.chunk_store.get(chunk_id)
             if not record:
                 continue
+            meta = record.get("metadata", {})
+            # Authoritative final check: a branch that ignored its filter cannot leak.
+            if scope is not None and not scope.matches(meta):
+                continue
+            score *= weights.get(meta.get("doc_type", ""), 1.0)
+            if boosts:
+                hay = f"{meta.get('author', '')} {record.get('text', '')}".lower()
+                if any(t in hay for t in boosts):
+                    score *= PERSON_BOOST
             candidates.append(
                 CandidateChunk(
                     chunk_id=chunk_id,
                     score=score,
                     source=sources.get(chunk_id, "rrf"),
                     text=record.get("text", ""),
-                    metadata=record.get("metadata", {}),
+                    metadata=meta,
                 )
             )
-        return candidates
+        candidates.sort(key=lambda c: (-c.score, c.chunk_id))
+        return candidates[:limit]
 
     def close(self) -> None:
         self.embedder.close()

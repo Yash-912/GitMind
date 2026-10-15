@@ -7,6 +7,9 @@ from .hybrid_retriever import HybridRetriever
 from .graph_walker import GraphExpander
 from .reranker import CrossEncoderReranker
 from .context_assembler import ContextAssembler
+from .scope import Scope, ScopeError
+from .graph_walker import GraphPathWalker, explain_path
+from .service import RetrievalOutcome, RetrievalService
 
 __all__ = [
     "QueryPlan",
@@ -19,4 +22,10 @@ __all__ = [
     "GraphExpander",
     "CrossEncoderReranker",
     "ContextAssembler",
+    "Scope",
+    "ScopeError",
+    "GraphPathWalker",
+    "explain_path",
+    "RetrievalOutcome",
+    "RetrievalService",
 ]
