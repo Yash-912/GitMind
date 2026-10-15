@@ -10,7 +10,9 @@ class CommitChunker(BaseChunker):
     """One chunk per commit (commit message only).
 
     The diff content is handled separately by DiffChunker.
-    Max 256 tokens per the PRD spec.
+    Max 256 tokens per the PRD spec. Messages longer than that are split
+    losslessly (with overlap) into several chunks; char_start/char_end are
+    offsets into the composed commit text (subject, body, files, stats).
     """
 
     def __init__(self, max_tokens: int = 256) -> None:
@@ -35,19 +37,22 @@ class CommitChunker(BaseChunker):
 
         text = "\n\n".join(text_parts)
 
-        # If somehow the message is enormous, truncate at max_chars
-        if len(text) > self.max_chars:
-            text = text[: self.max_chars]
-
-        metadata = ChunkMetadata(
-            doc_type="commit",
-            doc_id=commit.sha,
-            timestamp=commit.timestamp,
-            author=commit.author,
-            file_paths=commit.file_paths,
-            repo=repo,
-            graph_node_id=f"commit_{commit.sha}",
-            total_chunks=1,
-            chunk_index=0,
-        )
-        return [Chunk(text=text, metadata=metadata)]
+        spans = self._split_spans(text) or [(0, 0)]
+        chunks: list[Chunk] = []
+        for idx, (s, e) in enumerate(spans):
+            metadata = ChunkMetadata(
+                doc_type="commit",
+                doc_id=commit.sha,
+                timestamp=commit.timestamp,
+                author=commit.author,
+                file_paths=commit.file_paths,
+                repo=repo,
+                graph_node_id=f"commit_{commit.sha}",
+                total_chunks=len(spans),
+                chunk_index=idx,
+                commit_sha=commit.sha,
+                char_start=s,
+                char_end=e,
+            )
+            chunks.append(Chunk(text=text[s:e], metadata=metadata))
+        return chunks
