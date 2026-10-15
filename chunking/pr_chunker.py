@@ -32,14 +32,33 @@ class PRChunker(BaseChunker):
         chunks.extend(body_chunks)
 
         # ---- Review comments ----
-        for idx, comment in enumerate(pr.review_comments):
-            if not comment.strip():
-                continue
-            header = f"[PR #{pr.number} review comment #{idx + 1}]\n"
-            for text, s, e in self._split_with_header(header, comment.strip()):
-                meta = self._make_meta(pr, repo, extra_tags=["review_comment"])
-                meta.char_start, meta.char_end = s, e
-                chunks.append(Chunk(text=text, metadata=meta))
+        records = [r for r in getattr(pr, "review_comment_records", []) if r.body.strip()]
+        if records:
+            # Per-comment author / time / URL / thread are preserved.
+            for idx, rec in enumerate(records):
+                where = f" on {rec.path}" if rec.path else ""
+                by = f" by {rec.author}" if rec.author else ""
+                header = f"[PR #{pr.number} review comment #{idx + 1}{by}{where}]\n"
+                for text, s, e in self._split_with_header(header, rec.body.strip()):
+                    meta = self._make_meta(pr, repo, extra_tags=["review_comment"])
+                    meta.author = rec.author or pr.author
+                    meta.timestamp = rec.created_at or meta.timestamp
+                    meta.comment_ids = [rec.comment_id] if rec.comment_id is not None else []
+                    meta.comment_authors = [rec.author] if rec.author else []
+                    meta.thread_id = rec.thread_id
+                    meta.source_url = rec.url or meta.source_url
+                    meta.source_path = rec.path or ""
+                    meta.char_start, meta.char_end = s, e
+                    chunks.append(Chunk(text=text, metadata=meta))
+        else:
+            for idx, comment in enumerate(pr.review_comments):
+                if not comment.strip():
+                    continue
+                header = f"[PR #{pr.number} review comment #{idx + 1}]\n"
+                for text, s, e in self._split_with_header(header, comment.strip()):
+                    meta = self._make_meta(pr, repo, extra_tags=["review_comment"])
+                    meta.char_start, meta.char_end = s, e
+                    chunks.append(Chunk(text=text, metadata=meta))
 
         # Fix total_chunks
         total = len(chunks)
@@ -52,8 +71,16 @@ class PRChunker(BaseChunker):
     def _chunk_body(self, pr: ParsedPR, repo: str) -> list[Chunk]:
         header = (
             f"[PR #{pr.number}] {pr.title}\n"
-            f"Author: {pr.author} | State: {pr.state} | Labels: {', '.join(pr.labels) or 'none'}\n\n"
+            f"Author: {pr.author} | State: {pr.state} | Labels: {', '.join(pr.labels) or 'none'}\n"
         )
+        closing = getattr(pr, "closing_issue_numbers", None) or []
+        if closing:
+            incomplete = getattr(pr, "closing_issues_complete", None) is False
+            header += (
+                "Closes: " + ", ".join(f"#{n}" for n in closing)
+                + (" (list may be incomplete)" if incomplete else "") + "\n"
+            )
+        header += "\n"
         body = pr.body_clean or ""
 
         full_text = header + body
@@ -95,4 +122,5 @@ class PRChunker(BaseChunker):
             repo=repo,
             graph_node_id=f"pr_{pr.number}",
             entity_tags=(extra_tags or []) + pr.labels,
+            source_url=getattr(pr, "url", "") or "",
         )
