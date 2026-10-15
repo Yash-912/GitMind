@@ -13,6 +13,7 @@ from .chunk_store import ChunkStore
 from .query_embedder import QueryEmbedder
 
 PERSON_BOOST = 1.15
+OVERFETCH = 5  # branch over-fetch factor when it cannot pre-filter by scope
 
 
 class HybridRetriever:
@@ -51,6 +52,17 @@ class HybridRetriever:
             "fts": 0.6,
         }
         self._allowed_cache: dict[Any, frozenset[str]] = {}
+        self.branch_notes: list[str] = []   # degradations of the last retrieve_many call
+
+    @staticmethod
+    def _accepts_allowed_ids(index: Any) -> bool:
+        try:
+            params = inspect.signature(index.search).parameters
+        except (TypeError, ValueError):
+            return False
+        return "allowed_ids" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
 
     # ------------------------------------------------------------------ scope
 
@@ -124,7 +136,19 @@ class HybridRetriever:
                 time_start=filters.get("time_start") if filters else None,
                 time_end=filters.get("time_end") if filters else None,
             )
-        id_kwargs = {"allowed_ids": allowed} if allowed is not None else {}
+        self.branch_notes = []
+
+        def sparse(name: str, index: Any, query: str) -> list[Any]:
+            """Search a sparse branch, pre-filtering by allowed ids when it supports it."""
+            if allowed is None:
+                return index.search(query, limit=limit)
+            if self._accepts_allowed_ids(index):
+                return index.search(query, limit=limit, allowed_ids=allowed)
+            note = (f"{name} index cannot pre-filter by scope; over-fetching and filtering after "
+                    "retrieval (recall may be reduced under narrow scopes)")
+            if note not in self.branch_notes:
+                self.branch_notes.append(note)
+            return index.search(query, limit=limit * OVERFETCH)
 
         branch_lists: list[tuple[str, list[Any]]] = []
         for query in dict.fromkeys(q for q in queries if q and q.strip()):
@@ -138,8 +162,8 @@ class HybridRetriever:
                     ("qdrant_code",
                      self.qdrant.search_code(query_vector=vec, limit=limit, query_filter=q_filter))
                 )
-            branch_lists.append(("bm25", self.bm25.search(query, limit=limit, **id_kwargs)))
-            branch_lists.append(("fts", self.fts.search(query, limit=limit, **id_kwargs)))
+            branch_lists.append(("bm25", sparse("bm25", self.bm25, query)))
+            branch_lists.append(("fts", sparse("fts", self.fts, query)))
 
         scores: dict[str, float] = defaultdict(float)
         sources: dict[str, str] = {}

@@ -12,19 +12,26 @@ from .types import CandidateChunk
 class GraphExpander:
     """Expand candidates using temporal graph neighbors."""
 
-    def __init__(self, db_path: str, chunk_store: ChunkStore, hop_depth: int = 1) -> None:
+    def __init__(
+        self, db_path: str, chunk_store: ChunkStore, hop_depth: int = 1, repo: str = ""
+    ) -> None:
         self.walker = TemporalGraphWalker(db_path, hop_depth=hop_depth)
         self.chunk_store = chunk_store
+        self.repo = repo  # empty => taken from each candidate's metadata
 
     def expand(self, candidates: list[CandidateChunk]) -> list[CandidateChunk]:
-        node_ids = []
+        # The graph is repo-namespaced: always expand inside the seed's own repo.
+        by_repo: dict[str, list[tuple[str, str]]] = {}
         for c in candidates:
             node_id = c.metadata.get("graph_node_id")
             if node_id and "_" in node_id:
                 node_type, node_id_val = node_id.split("_", 1)
-                node_ids.append((node_type, node_id_val))
+                repo = self.repo or c.metadata.get("repo", "")
+                by_repo.setdefault(repo, []).append((node_type, node_id_val))
 
-        neighbors = self.walker.expand_many(node_ids)
+        neighbors: list[dict] = []
+        for repo, nodes in by_repo.items():
+            neighbors.extend(self.walker.expand_many(nodes, repo=repo))
         expanded: list[CandidateChunk] = list(candidates)
         seen = {c.chunk_id for c in candidates}
 
@@ -36,6 +43,8 @@ class GraphExpander:
                 record = self.chunk_store.get(chunk_id)
                 if not record:
                     continue
+                if record.get("metadata", {}).get("repo", "") not in by_repo:
+                    continue  # same node id in another repository
                 expanded.append(
                     CandidateChunk(
                         chunk_id=chunk_id,
@@ -60,8 +69,14 @@ class GraphExpander:
 # Only an explicit closing link is treated as causal evidence. Mentions and
 # references are weak links; `parent` is ancestry. None of those may be
 # presented as "X caused Y".
-CAUSAL_RELATIONS = frozenset({"closes"})
-ANCESTRY_RELATIONS = frozenset({"parent"})
+#
+# Relation names are the real D1 vocabulary: merge_commit (commit->pr),
+# mentions, closes (pr->issue), parent (commit->commit), references,
+# follow_up (issue->commit that fixed it). `follow_up` is explicit fix
+# provenance, so it is treated as causal evidence; `merge_commit` and `parent`
+# are ancestry.
+CAUSAL_RELATIONS = frozenset({"closes", "follow_up"})
+ANCESTRY_RELATIONS = frozenset({"parent", "merge_commit"})
 NO_CAUSAL_WARNING = "no causal evidence found, only mentions/ancestry"
 
 
@@ -145,13 +160,16 @@ class GraphPathWalker:
                 e for e in self.graph.neighbors(seed, scope.repo, hops=self.hops, direction="both")
                 if getattr(e, "repo", scope.repo) == scope.repo
             ]
+            foreign = {e.dst for e in edges if getattr(e, "dst_repo", "")}
             for path in self._chain(seed, edges):
                 nodes = {seed}
                 for h in path:
                     nodes.update((h.src, h.dst))
                 nodes.discard(seed)
                 node_chunks = {n: self._in_scope_chunks(n, scope) for n in nodes}
-                if any(not chunks for chunks in node_chunks.values()):
+                # Foreign-repo targets (dst_repo set, id like 'issue_other/repo#7')
+                # are references, not retrievable chunks: keep them as evidence.
+                if any(not chunks for n, chunks in node_chunks.items() if n not in foreign):
                     continue  # an endpoint is out of scope / not retrievable
                 key = tuple(path)
                 if key in seen_paths:
