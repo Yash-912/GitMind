@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
@@ -30,10 +31,19 @@ def normalize_github_repo(value: str) -> str:
     return value.lower()
 
 
+def _configured_urls(repo: Repo, remote) -> list[str]:
+    """URLs as written in config (``insteadOf`` rewrites are not identity)."""
+    try:
+        out = repo.git.config("--get-all", f"remote.{remote.name}.url")
+    except Exception:
+        return list(remote.urls)
+    return [line for line in out.splitlines() if line]
+
+
 def repository_identity(repo: Repo, github_repo: str | None = None) -> str:
     origins = []
     for remote in repo.remotes:
-        for url in remote.urls:
+        for url in _configured_urls(repo, remote):
             try:
                 origins.append(normalize_github_repo(url))
             except ValueError:
@@ -50,24 +60,7 @@ def repository_identity(repo: Repo, github_repo: str | None = None) -> str:
     return Path(repo.working_tree_dir or repo.git_dir).resolve().as_uri()
 
 
-def clone_github_repository(
-    repo_id: str,
-    target: Path,
-    *,
-    history: str = "full",
-    depth: int = 500,
-    token: str | None = None,
-) -> Path:
-    repo_id = normalize_github_repo(repo_id)
-    target = target.resolve()
-    if history not in {"full", "shallow"} or depth < 1:
-        raise ValueError("Invalid history mode or clone depth")
-    if target.exists():
-        with Repo(target) as repo:
-            repository_identity(repo, repo_id)
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".gitmind-clone-", dir=target.parent))
+def _git_env(token: str | None) -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     if token:
@@ -77,6 +70,97 @@ def clone_github_repository(
         env[f"GIT_CONFIG_KEY_{count}"] = "http.https://github.com/.extraheader"
         encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
         env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {encoded}"
+    return env
+
+
+@dataclass(frozen=True)
+class ManagedCloneState:
+    """Result of syncing a managed clone: the ref that was advanced and its SHA."""
+
+    ref: str
+    remote: str
+    sha: str
+
+
+def refresh_managed_clone(
+    target: Path,
+    repo_id: str,
+    *,
+    ref: str | None = None,
+    token: str | None = None,
+) -> ManagedCloneState:
+    """Fetch and fast-forward ``ref`` (default: the checked-out branch).
+
+    Returns the resolved commit SHA now at HEAD. Any failure raises
+    RuntimeError; callers must not claim coverage of the stale history.
+    """
+    repo_id = normalize_github_repo(repo_id)
+    env = _git_env(token)
+
+    def git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(target), *args],
+                check=True,
+                timeout=600,
+                env=env,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise RuntimeError(
+                f"Updating the managed clone failed during 'git {args[0]}'. "
+                "Check access and connectivity; the stored history may be stale."
+            ) from None
+
+    with Repo(target) as repo:
+        remote = None
+        for candidate in repo.remotes:
+            for url in _configured_urls(repo, candidate):
+                try:
+                    if normalize_github_repo(url) == repo_id:
+                        remote = candidate.name
+                except ValueError:
+                    continue
+        if remote is None:
+            raise RuntimeError("The managed clone has no remote for the repository")
+        if ref is None:
+            if repo.head.is_detached:
+                raise RuntimeError("Detached HEAD: pass an explicit ref to sync")
+            ref = repo.active_branch.name
+        dirty = repo.is_dirty(untracked_files=False)
+    if dirty:
+        raise RuntimeError("The managed clone has local changes; refusing to update")
+    git("fetch", "--prune", "--tags", remote)
+    tracking = f"refs/remotes/{remote}/{ref}"
+    git("rev-parse", "--verify", "--quiet", tracking)
+    if git("rev-parse", "--abbrev-ref", "HEAD") != ref:
+        git("checkout", "-B", ref, "--track", f"{remote}/{ref}")
+    git("merge", "--ff-only", tracking)
+    return ManagedCloneState(ref=ref, remote=remote, sha=git("rev-parse", "HEAD"))
+
+
+def clone_github_repository(
+    repo_id: str,
+    target: Path,
+    *,
+    history: str = "full",
+    depth: int = 500,
+    token: str | None = None,
+    ref: str | None = None,
+) -> Path:
+    repo_id = normalize_github_repo(repo_id)
+    target = target.resolve()
+    if history not in {"full", "shallow"} or depth < 1:
+        raise ValueError("Invalid history mode or clone depth")
+    if target.exists():
+        with Repo(target) as repo:
+            repository_identity(repo, repo_id)
+        refresh_managed_clone(target, repo_id, ref=ref, token=token)
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".gitmind-clone-", dir=target.parent))
+    env = _git_env(token)
     cmd = ["git", "clone"]
     if history == "shallow":
         cmd += ["--depth", str(depth)]
