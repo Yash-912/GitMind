@@ -42,15 +42,31 @@ class IssueChunker(BaseChunker):
             chunks.append(Chunk(text=text, metadata=meta))
 
         # ---- Comment sliding window ----
-        comments = [c for c in issue.comments if c.strip()]
+        records = [r for r in getattr(issue, "comment_records", []) if r.body.strip()]
+        if records:
+            comments = [r.body for r in records]
+        else:
+            comments = [c for c in issue.comments if c.strip()]
         step = max(self.window_size - self.overlap, 1)
         start = 0
         while start < len(comments):
             window = comments[start : start + self.window_size]
             header, joined = self._format_window(issue, window, start)
+            win_records = records[start : start + self.window_size]
             for text, s, e in self._split_with_header(header, joined):
                 meta = self._make_meta(issue, repo)
                 meta.char_start, meta.char_end = s, e
+                if win_records:
+                    first = win_records[0]
+                    meta.author = first.author or issue.author
+                    meta.timestamp = first.created_at or meta.timestamp
+                    meta.comment_ids = [
+                        r.comment_id for r in win_records if r.comment_id is not None
+                    ]
+                    meta.comment_authors = list(
+                        dict.fromkeys(r.author for r in win_records if r.author)
+                    )
+                    meta.source_url = first.url or meta.source_url
                 chunks.append(Chunk(text=text, metadata=meta))
             if start + self.window_size >= len(comments):
                 break
@@ -79,4 +95,5 @@ class IssueChunker(BaseChunker):
             repo=repo,
             graph_node_id=f"issue_{issue.number}",
             entity_tags=issue.labels,
+            source_url=getattr(issue, "url", "") or "",
         )

@@ -108,6 +108,23 @@ class ChangelogChunker(BaseChunker):
             return self._reindex(chunks)
 
         chunks = []
+        # Text before the first version heading is kept as a preamble chunk
+        # (a bare "# Changelog" title carries no information and is skipped).
+        preamble = body[: sections[0].start].strip()
+        if any(ln.strip() and not ln.lstrip().startswith("#") for ln in preamble.splitlines()):
+            header = f"[Release {release.tag} preamble]\n\n"
+            offset = body.index(preamble)
+            for text, s, e in self._split_with_header(header, preamble):
+                meta = ChunkMetadata(
+                    doc_type="release",
+                    doc_id=release.tag,
+                    timestamp=release.timestamp or datetime.utcnow(),
+                    repo=repo,
+                    graph_node_id=f"release_{release.tag}",
+                    char_start=offset + s,
+                    char_end=offset + e,
+                )
+                chunks.append(Chunk(text=text, metadata=meta))
         for section in sections:
             header = f"[Release {section.version}]\n{section.heading}\n\n"
             ts = section.date or release.timestamp or datetime.utcnow()
