@@ -23,6 +23,10 @@ class ChangelogSection:
     body: str
     version: str
     date: datetime | None
+    # Offsets into the text passed to parse_changelog()
+    start: int = 0          # start of the heading
+    end: int = 0            # end of the section (start of next heading / EOF)
+    body_start: int = 0     # where ``body`` (stripped) begins
 
 
 def _parse_date_from_heading(heading: str) -> datetime | None:
@@ -48,32 +52,34 @@ def _parse_version_from_heading(heading: str) -> str:
 
 
 def parse_changelog(text: str) -> list[ChangelogSection]:
-    """Split a full CHANGELOG text into version sections."""
-    splits = _VERSION_HEADING.split(text)
+    """Split a full CHANGELOG text into version sections (with source offsets)."""
+    matches = list(_VERSION_HEADING.finditer(text))
     sections: list[ChangelogSection] = []
-    # splits alternates: [preamble, heading, body, heading, body, ...]
-    i = 0
-    while i < len(splits):
-        token = splits[i]
-        if _VERSION_HEADING.match(token):
-            heading = token.strip()
-            body = splits[i + 1].strip() if i + 1 < len(splits) else ""
-            sections.append(
-                ChangelogSection(
-                    heading=heading,
-                    body=body,
-                    version=_parse_version_from_heading(heading),
-                    date=_parse_date_from_heading(heading),
-                )
+    for i, m in enumerate(matches):
+        heading = m.group(1).strip()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        raw = text[m.end():end]
+        sections.append(
+            ChangelogSection(
+                heading=heading,
+                body=raw.strip(),
+                version=_parse_version_from_heading(heading),
+                date=_parse_date_from_heading(heading),
+                start=m.start(),
+                end=end,
+                body_start=m.end() + (len(raw) - len(raw.lstrip())),
             )
-            i += 2
-        else:
-            i += 1
+        )
     return sections
 
 
 class ChangelogChunker(BaseChunker):
-    """One chunk per version section in a CHANGELOG or release notes body."""
+    """One chunk per version section in a CHANGELOG or release notes body.
+
+    Sections longer than max_tokens are split losslessly with overlap; every
+    piece keeps its own deterministic ID and char_start/char_end offsets into
+    the release body.
+    """
 
     def __init__(self, max_tokens: int = 600) -> None:
         super().__init__(max_tokens=max_tokens)
@@ -85,44 +91,43 @@ class ChangelogChunker(BaseChunker):
         # Try to split into sub-sections (useful for aggregated CHANGELOG files)
         sections = parse_changelog(body)
         if not sections:
-            # Single release note: treat as one chunk
-            text = f"[Release {release.tag}]\n\n{body}"
-            meta = ChunkMetadata(
-                doc_type="release",
-                doc_id=release.tag,
-                timestamp=release.timestamp or datetime.utcnow(),
-                repo=repo,
-                graph_node_id=f"release_{release.tag}",
-                total_chunks=1,
-                chunk_index=0,
-            )
-            return [Chunk(text=text[:self.max_chars], metadata=meta)]
-
-        chunks: list[Chunk] = []
-        for idx, section in enumerate(sections):
-            text = f"[Release {section.version}]\n{section.heading}\n\n{section.body}"
-            ts = section.date or release.timestamp or datetime.utcnow()
-            meta = ChunkMetadata(
-                doc_type="release",
-                doc_id=section.version,
-                timestamp=ts,
-                repo=repo,
-                graph_node_id=f"release_{section.version}",
-                chunk_index=idx,
-                total_chunks=len(sections),
-            )
-            if len(text) > self.max_chars:
-                for sub_idx, sub_text in enumerate(self._split_by_chars(text)):
-                    import copy
-                    sub_meta = copy.deepcopy(meta)
-                    chunks.append(Chunk(text=sub_text, metadata=sub_meta))
-            else:
+            # Single release note: split only if over the limit
+            header = f"[Release {release.tag}]\n\n"
+            chunks: list[Chunk] = []
+            for text, s, e in self._split_with_header(header, body):
+                meta = ChunkMetadata(
+                    doc_type="release",
+                    doc_id=release.tag,
+                    timestamp=release.timestamp or datetime.utcnow(),
+                    repo=repo,
+                    graph_node_id=f"release_{release.tag}",
+                    char_start=s,
+                    char_end=e,
+                )
                 chunks.append(Chunk(text=text, metadata=meta))
+            return self._reindex(chunks)
 
-        # Rewrite total_chunks
+        chunks = []
+        for section in sections:
+            header = f"[Release {section.version}]\n{section.heading}\n\n"
+            ts = section.date or release.timestamp or datetime.utcnow()
+            for text, s, e in self._split_with_header(header, section.body):
+                meta = ChunkMetadata(
+                    doc_type="release",
+                    doc_id=section.version,
+                    timestamp=ts,
+                    repo=repo,
+                    graph_node_id=f"release_{section.version}",
+                    char_start=section.body_start + s,
+                    char_end=section.body_start + e,
+                )
+                chunks.append(Chunk(text=text, metadata=meta))
+        return self._reindex(chunks)
+
+    @staticmethod
+    def _reindex(chunks: list[Chunk]) -> list[Chunk]:
         total = len(chunks)
         for i, c in enumerate(chunks):
             c.metadata.chunk_index = i
             c.metadata.total_chunks = total
-
         return chunks

@@ -8,6 +8,9 @@ from parsing.multi_schema_parser import ParsedIssue
 # PRD §7.4:
 #   - Issue body: whole chunk
 #   - Comment thread: sliding window of 3 consecutive comments with 1-comment overlap
+# Oversized bodies / windows are split losslessly (with overlap), the header is
+# repeated on each piece, and char_start/char_end are offsets into the body
+# (resp. the joined window text).
 
 
 class IssueChunker(BaseChunker):
@@ -33,10 +36,10 @@ class IssueChunker(BaseChunker):
             f"Author: {issue.author} | State: {issue.state} | "
             f"Labels: {', '.join(issue.labels) or 'none'}\n\n"
         )
-        body_text = body_header + (issue.body_clean or "")
-        if len(body_text) > self.max_chars:
-            body_text = body_text[: self.max_chars]
-        chunks.append(Chunk(text=body_text, metadata=self._make_meta(issue, repo)))
+        for text, s, e in self._split_with_header(body_header, issue.body_clean or ""):
+            meta = self._make_meta(issue, repo)
+            meta.char_start, meta.char_end = s, e
+            chunks.append(Chunk(text=text, metadata=meta))
 
         # ---- Comment sliding window ----
         comments = [c for c in issue.comments if c.strip()]
@@ -44,12 +47,13 @@ class IssueChunker(BaseChunker):
         start = 0
         while start < len(comments):
             window = comments[start : start + self.window_size]
-            window_text = self._format_window(issue, window, start)
-            if len(window_text) > self.max_chars:
-                window_text = window_text[: self.max_chars]
-            chunks.append(
-                Chunk(text=window_text, metadata=self._make_meta(issue, repo))
-            )
+            header, joined = self._format_window(issue, window, start)
+            for text, s, e in self._split_with_header(header, joined):
+                meta = self._make_meta(issue, repo)
+                meta.char_start, meta.char_end = s, e
+                chunks.append(Chunk(text=text, metadata=meta))
+            if start + self.window_size >= len(comments):
+                break
             start += step
 
         # Fix chunk indices
@@ -62,9 +66,9 @@ class IssueChunker(BaseChunker):
 
     def _format_window(
         self, issue: ParsedIssue, window: list[str], start_idx: int
-    ) -> str:
+    ) -> tuple[str, str]:
         header = f"[Issue #{issue.number} comments {start_idx + 1}–{start_idx + len(window)}]\n\n"
-        return header + "\n\n---\n\n".join(window)
+        return header, "\n\n---\n\n".join(window)
 
     def _make_meta(self, issue: ParsedIssue, repo: str) -> ChunkMetadata:
         return ChunkMetadata(

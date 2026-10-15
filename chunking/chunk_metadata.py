@@ -5,12 +5,46 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# Bump when chunking behaviour changes so IDs of re-chunked content change too.
+CHUNKER_VERSION = "2"
+
+_CHUNK_NAMESPACE = uuid.UUID("6f1c7a52-3b0e-5d44-9a1e-8c2f4b7d9e10")
+
+
+def stable_chunk_id(
+    repo: str,
+    doc_type: str,
+    doc_id: str,
+    file_paths: list[str] | tuple[str, ...],
+    text: str,
+    occurrence: int = 0,
+    chunker_version: str = CHUNKER_VERSION,
+) -> str:
+    """Deterministic chunk identity (uuid5) — same input always yields the same ID.
+
+    ``occurrence`` disambiguates chunks of one document whose other fields and
+    text are identical.
+    """
+    key = "\x1f".join(
+        [
+            chunker_version,
+            repo or "",
+            doc_type or "",
+            str(doc_id),
+            "\x1e".join(file_paths or ()),
+            str(int(occurrence)),
+            text,
+        ]
+    )
+    return str(uuid.uuid5(_CHUNK_NAMESPACE, key))
+
 
 @dataclass
 class ChunkMetadata:
     """Rich metadata attached to every chunk before embedding."""
 
-    chunk_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Assigned deterministically by BaseChunker after chunking (see stable_chunk_id).
+    chunk_id: str = ""
     doc_type: str = ""          # "commit" | "diff" | "pr" | "issue" | "release"
     doc_id: str = ""            # commit SHA, PR number, issue number, tag, etc.
     timestamp: datetime = field(default_factory=datetime.utcnow)
@@ -23,6 +57,14 @@ class ChunkMetadata:
     # Optional sub-type info
     chunk_index: int = 0        # position within parent document
     total_chunks: int = 1       # total chunks for this document
+    # Source provenance
+    commit_sha: str = ""
+    source_path: str = ""
+    line_start: int | None = None   # 1-based, inclusive
+    line_end: int | None = None
+    char_start: int | None = None   # offsets into the source text (see each chunker)
+    char_end: int | None = None
+    scope: str = "history"          # "history" | "snapshot"
 
     def to_dict(self) -> dict:
         return {
@@ -38,4 +80,11 @@ class ChunkMetadata:
             "repo": self.repo,
             "chunk_index": self.chunk_index,
             "total_chunks": self.total_chunks,
+            "commit_sha": self.commit_sha,
+            "source_path": self.source_path,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "char_start": self.char_start,
+            "char_end": self.char_end,
+            "scope": self.scope,
         }

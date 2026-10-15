@@ -10,6 +10,9 @@ from parsing.multi_schema_parser import ParsedPR
 #   - Kept whole if < 1000 tokens (~4000 chars)
 #   - Split at Markdown section boundaries if longer
 #   - Review comments: each top-level comment + thread as one chunk
+# Oversized sections / comments are split losslessly (with overlap), repeating
+# the header on each piece. char_start/char_end are offsets into the PR body
+# (body chunks) or into the individual review comment (comment chunks).
 
 _SECTION_SPLIT = re.compile(r"(?=^#{1,3} )", re.MULTILINE)
 
@@ -32,9 +35,11 @@ class PRChunker(BaseChunker):
         for idx, comment in enumerate(pr.review_comments):
             if not comment.strip():
                 continue
-            text = f"[PR #{pr.number} review comment #{idx + 1}]\n{comment.strip()}"
-            meta = self._make_meta(pr, repo, extra_tags=["review_comment"])
-            chunks.append(Chunk(text=text, metadata=meta))
+            header = f"[PR #{pr.number} review comment #{idx + 1}]\n"
+            for text, s, e in self._split_with_header(header, comment.strip()):
+                meta = self._make_meta(pr, repo, extra_tags=["review_comment"])
+                meta.char_start, meta.char_end = s, e
+                chunks.append(Chunk(text=text, metadata=meta))
 
         # Fix total_chunks
         total = len(chunks)
@@ -53,23 +58,33 @@ class PRChunker(BaseChunker):
 
         full_text = header + body
         if self._estimate_tokens(full_text) <= self.max_tokens:
-            return [Chunk(text=full_text, metadata=self._make_meta(pr, repo))]
+            meta = self._make_meta(pr, repo)
+            meta.char_start, meta.char_end = 0, len(body)
+            return [Chunk(text=full_text, metadata=meta)]
 
         # Split at Markdown headings
-        sections = _SECTION_SPLIT.split(body)
-        chunks: list[Chunk] = []
-        for section in sections:
-            if not section.strip():
-                continue
-            text = header + section.strip()
-            if self._estimate_tokens(text) > self.max_tokens:
-                # Further split by characters
-                for sub in self._split_by_chars(text):
-                    chunks.append(Chunk(text=sub, metadata=self._make_meta(pr, repo)))
-            else:
-                chunks.append(Chunk(text=text, metadata=self._make_meta(pr, repo)))
+        bounds = [m.start() for m in _SECTION_SPLIT.finditer(body)]
+        if not bounds or bounds[0] != 0:
+            bounds.insert(0, 0)
+        bounds.append(len(body))
 
-        return chunks if chunks else [Chunk(text=full_text[:self.max_chars], metadata=self._make_meta(pr, repo))]
+        chunks: list[Chunk] = []
+        for lo, hi in zip(bounds, bounds[1:]):
+            raw = body[lo:hi]
+            section = raw.strip()
+            if not section:
+                continue
+            base = lo + (len(raw) - len(raw.lstrip()))
+            for text, s, e in self._split_with_header(header, section):
+                meta = self._make_meta(pr, repo)
+                meta.char_start, meta.char_end = base + s, base + e
+                chunks.append(Chunk(text=text, metadata=meta))
+
+        if chunks:
+            return chunks
+        meta = self._make_meta(pr, repo)
+        meta.char_start, meta.char_end = 0, len(body)
+        return [Chunk(text=full_text, metadata=meta)]
 
     def _make_meta(self, pr: ParsedPR, repo: str, extra_tags: list[str] | None = None) -> ChunkMetadata:
         return ChunkMetadata(

@@ -1,6 +1,7 @@
 """multi_schema_parser.py — Per-document-type structured extraction from raw SQLite payloads."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -37,7 +38,8 @@ class ParsedPR:
     merged_at: datetime | None
     labels: list[str]
     review_comments: list[str]
-    linked_issue_numbers: list[int] = field(default_factory=list)
+    linked_issue_numbers: list[int] = field(default_factory=list)   # local repo only
+    external_issue_refs: list[str] = field(default_factory=list)    # "owner/repo#N"
 
 
 @dataclass
@@ -86,6 +88,35 @@ class ParsedPRGraphQL:
     closing_issues: list[str]
 
 
+# One repo-aware reference pattern: full GitHub URLs, ``owner/repo#N`` and bare ``#N``.
+# A bare ``#N`` must not be glued to a word/path/entity (``a/b#7`` is never local).
+_REF_RE = re.compile(
+    r"https?://github\.com/(?P<urepo>[\w.-]+/[\w.-]+)/(?:issues|pull)/(?P<unum>\d+)"
+    r"|(?<![\w/&.-])(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<num>\d+)(?!\w)"
+)
+_CODE_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`|<!--.*?-->", re.DOTALL)
+
+
+def extract_issue_refs(text: str, local_repo: str = "") -> tuple[list[int], list[str]]:
+    """Return (local issue numbers, foreign ``owner/repo#N`` refs) found in ``text``.
+
+    Code blocks, inline code and HTML comments are ignored. References carrying
+    a repository (``owner/repo#N`` or a GitHub URL) are local only when that
+    repository equals ``local_repo`` (case-insensitive); otherwise they keep
+    their namespace and are never reported as local.
+    """
+    local: set[int] = set()
+    foreign: dict[str, None] = {}
+    for m in _REF_RE.finditer(_CODE_RE.sub(" ", text or "")):
+        repo = m.group("urepo") or m.group("repo")
+        num = int(m.group("unum") or m.group("num"))
+        if repo and repo.lower() != (local_repo or "").lower():
+            foreign[f"{repo}#{num}"] = None
+        else:
+            local.add(num)
+    return sorted(local), list(foreign)
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -110,7 +141,8 @@ class MultiSchemaParser:
         message: str = payload.get("message", "")
         lines = message.splitlines()
         subject = lines[0].strip() if lines else ""
-        body = "\n".join(lines[2:]).strip() if len(lines) > 2 else ""
+        # Keep every line after the subject (a blank separator is stripped, line 2 is not lost)
+        body = "\n".join(lines[1:]).strip()
 
         diff_text: str = payload.get("diff_text", "")
         hunks = self._diff_parser.parse(diff_text)
@@ -132,16 +164,14 @@ class MultiSchemaParser:
         )
 
     def parse_pr(self, payload: dict[str, Any]) -> ParsedPR:
-        import re
-
         body_raw: str = payload.get("body", "") or ""
         body_clean = self._cleaner.clean_markdown(body_raw)
 
-        # Extract #NNN issue references from body + title
-        issue_refs = [
-            int(n)
-            for n in re.findall(r"#(\d+)", (payload.get("title", "") or "") + body_raw)
-        ]
+        # Repo-aware #NNN extraction from title + body (foreign refs keep their namespace)
+        local_refs, foreign_refs = extract_issue_refs(
+            (payload.get("title", "") or "") + "\n" + body_raw,
+            payload.get("repo", "") or "",
+        )
 
         return ParsedPR(
             number=int(payload.get("number", 0)),
@@ -153,7 +183,8 @@ class MultiSchemaParser:
             merged_at=_parse_dt(payload.get("merged_at")),
             labels=payload.get("labels", []) or [],
             review_comments=payload.get("review_comments", []) or [],
-            linked_issue_numbers=list(set(issue_refs)),
+            linked_issue_numbers=local_refs,
+            external_issue_refs=foreign_refs,
         )
 
     def parse_issue(self, payload: dict[str, Any]) -> ParsedIssue:

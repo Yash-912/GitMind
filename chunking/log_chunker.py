@@ -23,25 +23,10 @@ class LogChunker(BaseChunker):
         text = f"{header}\n\n{body}".strip()
 
         chunks: list[Chunk] = []
-        if len(text) > self.max_chars:
-            for part in self._split_by_chars(text):
-                chunks.append(
-                    Chunk(
-                        text=part,
-                        metadata=ChunkMetadata(
-                            doc_type=self.doc_type,
-                            doc_id=doc_id,
-                            timestamp=timestamp or __import__("datetime").datetime.utcnow(),
-                            author=author,
-                            repo=repo,
-                            graph_node_id=f"{self.doc_type}_{doc_id}",
-                        ),
-                    )
-                )
-        else:
+        for s, e in self._split_spans(text) or [(0, 0)]:
             chunks.append(
                 Chunk(
-                    text=text,
+                    text=text[s:e],
                     metadata=ChunkMetadata(
                         doc_type=self.doc_type,
                         doc_id=doc_id,
@@ -49,6 +34,8 @@ class LogChunker(BaseChunker):
                         author=author,
                         repo=repo,
                         graph_node_id=f"{self.doc_type}_{doc_id}",
+                        char_start=s,
+                        char_end=e,
                     ),
                 )
             )
