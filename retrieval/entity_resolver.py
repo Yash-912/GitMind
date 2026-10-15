@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
 from entities.entity_registry import EntityRegistry
 from generation.llm_client import LLMClient
+
+
+_KIND_ALIASES = {"tech": "technology"}
+
+
+@dataclass(frozen=True)
+class ResolvedEntity:
+    name: str      # canonical name (or the raw term when unknown)
+    kind: str      # module | symbol | person | technology | concept | unknown
+    surface: str   # the form used in the query
 
 
 class EntityResolver:
@@ -23,6 +34,40 @@ class EntityResolver:
             else:
                 resolved.append(term)
         return list(dict.fromkeys(resolved))
+
+    # ---- typed resolution (F05) -------------------------------------- #
+
+    def resolve_typed(self, terms: list[str]) -> list["ResolvedEntity"]:
+        """Resolve terms to entities *with their kind*.
+
+        Only an exact (case-insensitive) match on a canonical name or alias
+        counts: the registry's prefix search would otherwise turn ordinary words
+        into module filters. Anything unmatched has kind ``unknown`` and must
+        never be used as a filter.
+        """
+        out: list[ResolvedEntity] = []
+        for term in dict.fromkeys(t.strip() for t in terms if t and t.strip()):
+            folded = term.casefold()
+            match = None
+            for rec in self.registry.search(term, limit=10):
+                names = {rec.canonical_name.casefold(), *(a.casefold() for a in rec.aliases)}
+                if folded in names:
+                    match = rec
+                    break
+            if match is None:
+                out.append(ResolvedEntity(name=term, kind="unknown", surface=term))
+                continue
+            raw = getattr(match, "kind", None) or match.entity_type
+            out.append(ResolvedEntity(match.canonical_name, _KIND_ALIASES.get(raw, raw), term))
+        return out
+
+    def resolve_from_query_typed(self, query: str) -> list["ResolvedEntity"]:
+        extracted = self._llm_extract_entities(query)
+        if not extracted:
+            extracted = re.findall(r"\"([^\"]+)\"", query)
+        if not extracted:
+            extracted = query.split()
+        return self.resolve_typed(extracted)
 
     def resolve_from_query(self, query: str) -> list[str]:
         extracted = self._llm_extract_entities(query)
