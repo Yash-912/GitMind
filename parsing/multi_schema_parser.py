@@ -28,6 +28,22 @@ class ParsedCommit:
 
 
 @dataclass
+class ParsedComment:
+    """One discussion comment with its own author, time, URL and thread."""
+
+    comment_id: int | None
+    kind: str                       # "issue_comment" | "review_comment"
+    author: str
+    created_at: datetime | None
+    updated_at: datetime | None
+    url: str
+    body: str
+    parent_id: int | None = None
+    thread_id: int | None = None
+    path: str | None = None
+
+
+@dataclass
 class ParsedPR:
     number: int
     title: str
@@ -40,6 +56,13 @@ class ParsedPR:
     review_comments: list[str]
     linked_issue_numbers: list[int] = field(default_factory=list)   # local repo only
     external_issue_refs: list[str] = field(default_factory=list)    # "owner/repo#N"
+    # Canonical GraphQL closing references merged into the PR record
+    closing_issue_numbers: list[int] = field(default_factory=list)
+    closing_issues: list[str] = field(default_factory=list)
+    closing_issues_complete: bool | None = None   # None: not merged from GraphQL
+    closing_source: str | None = None
+    url: str = ""
+    review_comment_records: list[ParsedComment] = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +76,8 @@ class ParsedIssue:
     closed_at: datetime | None
     labels: list[str]
     comments: list[str]
+    url: str = ""
+    comment_records: list[ParsedComment] = field(default_factory=list)
 
 
 @dataclass
@@ -86,6 +111,8 @@ class ParsedPRGraphQL:
     created_at: datetime | None
     merged_at: datetime | None
     closing_issues: list[str]
+    closing_issue_numbers: list[int] = field(default_factory=list)
+    closing_issues_complete: bool = True
 
 
 # One repo-aware reference pattern: full GitHub URLs, ``owner/repo#N`` and bare ``#N``.
@@ -115,6 +142,18 @@ def extract_issue_refs(text: str, local_repo: str = "") -> tuple[list[int], list
         else:
             local.add(num)
     return sorted(local), list(foreign)
+
+
+def _closing_numbers(payload: dict[str, Any]) -> list[int]:
+    """Closing issue numbers; falls back to parsing ``#N`` for old payloads."""
+    numbers = payload.get("closing_issue_numbers")
+    if numbers is None:
+        numbers = [
+            int(m)
+            for text in payload.get("closing_issues", []) or []
+            for m in re.findall(r"^#(\d+)", str(text))
+        ]
+    return [int(n) for n in dict.fromkeys(numbers)]
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -185,7 +224,38 @@ class MultiSchemaParser:
             review_comments=payload.get("review_comments", []) or [],
             linked_issue_numbers=local_refs,
             external_issue_refs=foreign_refs,
+            closing_issue_numbers=_closing_numbers(payload),
+            closing_issues=list(payload.get("closing_issues", []) or []),
+            closing_issues_complete=payload.get("closing_issues_complete"),
+            closing_source=payload.get("closing_source"),
+            url=payload.get("url", "") or "",
+            review_comment_records=self._parse_comments(
+                payload.get("review_comment_records"), clean=False
+            ),
         )
+
+    def _parse_comments(self, records, *, clean: bool) -> list[ParsedComment]:
+        """Typed comments from stored CommentRecord dicts (absent on old payloads)."""
+        parsed: list[ParsedComment] = []
+        for r in records or []:
+            if not isinstance(r, dict):
+                continue
+            body = r.get("body", "") or ""
+            parsed.append(
+                ParsedComment(
+                    comment_id=r.get("comment_id"),
+                    kind=r.get("kind", ""),
+                    author=r.get("author", "") or "",
+                    created_at=_parse_dt(r.get("created_at")),
+                    updated_at=_parse_dt(r.get("updated_at")),
+                    url=r.get("url", "") or "",
+                    body=self._cleaner.clean_markdown(body) if clean else body,
+                    parent_id=r.get("parent_id"),
+                    thread_id=r.get("thread_id"),
+                    path=r.get("path"),
+                )
+            )
+        return parsed
 
     def parse_issue(self, payload: dict[str, Any]) -> ParsedIssue:
         body_raw: str = payload.get("body", "") or ""
@@ -203,6 +273,10 @@ class MultiSchemaParser:
             closed_at=_parse_dt(payload.get("closed_at")),
             labels=payload.get("labels", []) or [],
             comments=comments_clean,
+            url=payload.get("url", "") or "",
+            comment_records=self._parse_comments(
+                payload.get("comment_records"), clean=True
+            ),
         )
 
     def parse_release(self, payload: dict[str, Any]) -> ParsedRelease:
@@ -249,4 +323,6 @@ class MultiSchemaParser:
             created_at=_parse_dt(payload.get("created_at")),
             merged_at=_parse_dt(payload.get("merged_at")),
             closing_issues=payload.get("closing_issues", []) or [],
+            closing_issue_numbers=_closing_numbers(payload),
+            closing_issues_complete=bool(payload.get("closing_issues_complete", True)),
         )

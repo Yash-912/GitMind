@@ -65,6 +65,11 @@ class ChunkMetadata:
     char_start: int | None = None   # offsets into the source text (see each chunker)
     char_end: int | None = None
     scope: str = "history"          # "history" | "snapshot"
+    # Discussion provenance (PR / issue comments)
+    comment_ids: list[int] = field(default_factory=list)
+    comment_authors: list[str] = field(default_factory=list)
+    thread_id: int | None = None
+    source_url: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -87,4 +92,8 @@ class ChunkMetadata:
             "char_start": self.char_start,
             "char_end": self.char_end,
             "scope": self.scope,
+            "comment_ids": self.comment_ids,
+            "comment_authors": self.comment_authors,
+            "thread_id": self.thread_id,
+            "source_url": self.source_url,
         }

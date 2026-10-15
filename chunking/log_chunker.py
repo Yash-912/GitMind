@@ -8,9 +8,14 @@ from .chunk_metadata import ChunkMetadata
 class LogChunker(BaseChunker):
     """Generic chunker for log-like documents."""
 
-    def __init__(self, doc_type: str, max_tokens: int = 600) -> None:
+    def __init__(
+        self, doc_type: str, max_tokens: int = 600, node_type: str | None = None
+    ) -> None:
         super().__init__(max_tokens=max_tokens)
         self.doc_type = doc_type
+        # Graph node namespace; a GraphQL PR record is node ``pr_<n>``, never
+        # ``pr_graphql_<n>``.
+        self.node_type = node_type or ("pr" if doc_type == "pr_graphql" else doc_type)
 
     def chunk(self, parsed_doc, *, repo: str = "") -> list[Chunk]:  # type: ignore[override]
         title = getattr(parsed_doc, "title", "") or getattr(parsed_doc, "name", "")
@@ -21,6 +26,13 @@ class LogChunker(BaseChunker):
 
         header = f"[{self.doc_type}] {title}".strip()
         text = f"{header}\n\n{body}".strip()
+        closing = getattr(parsed_doc, "closing_issue_numbers", None) or []
+        if closing:
+            incomplete = getattr(parsed_doc, "closing_issues_complete", True) is False
+            text += (
+                "\n\nCloses: " + ", ".join(f"#{n}" for n in closing)
+                + (" (list may be incomplete)" if incomplete else "")
+            )
 
         chunks: list[Chunk] = []
         for s, e in self._split_spans(text) or [(0, 0)]:
@@ -33,7 +45,7 @@ class LogChunker(BaseChunker):
                         timestamp=timestamp or __import__("datetime").datetime.utcnow(),
                         author=author,
                         repo=repo,
-                        graph_node_id=f"{self.doc_type}_{doc_id}",
+                        graph_node_id=f"{self.node_type}_{doc_id}",
                         char_start=s,
                         char_end=e,
                     ),
