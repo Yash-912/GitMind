@@ -73,7 +73,9 @@ class RetrievalService:
         assembler_factory: Callable[[str], ContextAssembler] | None = None,
         startup_warnings: list[str] | None = None,
         closers: list[Callable[[], None]] | None = None,
+        repo: str = "",
     ) -> None:
+        self.repo = repo  # the repository this service was loaded for ("" = not enforced)
         self.chunk_store = chunk_store
         self.retriever = retriever
         self.reranker = reranker
@@ -99,6 +101,9 @@ class RetrievalService:
         decomposer: Any = None,
         resolver: Any = None,
         graph: Any = None,
+        qdrant: Any = None,
+        bm25: Any = None,
+        fts: Any = None,
     ) -> "RetrievalService":
         """Load everything for one active generation (do this once, not per query).
 
@@ -124,16 +129,18 @@ class RetrievalService:
         closers: list[Callable[[], None]] = []
         try:
             chunk_store = ChunkStore(str(gen.chunks_path))
-            bm25 = BM25Index(index_dir=str(gen.bm25_dir))
-            fts = FTSIndex(db_path=str(gen.fts_path))
-            closers.append(fts.close)
-            qdrant_kwargs: dict[str, Any] = {}
-            if identity and identity.get("dim"):
-                qdrant_kwargs["semantic_dim"] = int(identity["dim"])
-            qdrant = QdrantStore(
-                path=settings.qdrant_path, collection_name=gen.qdrant_collection, **qdrant_kwargs
-            )
-            closers.append(qdrant.close)
+            bm25 = bm25 or BM25Index(index_dir=str(gen.bm25_dir))
+            if fts is None:
+                fts = FTSIndex(db_path=str(gen.fts_path))
+                closers.append(fts.close)
+            if qdrant is None:
+                qdrant_kwargs: dict[str, Any] = {}
+                if identity and identity.get("dim"):
+                    qdrant_kwargs["semantic_dim"] = int(identity["dim"])
+                qdrant = QdrantStore(
+                    path=settings.qdrant_path, collection_name=gen.qdrant_collection, **qdrant_kwargs
+                )
+                closers.append(qdrant.close)
             retriever = HybridRetriever(
                 qdrant=qdrant, bm25=bm25, fts=fts, chunk_store=chunk_store, embedder=embedder
             )
@@ -147,7 +154,7 @@ class RetrievalService:
                 try:
                     from .entity_resolver import EntityResolver
 
-                    resolver = EntityResolver(settings.db_path)
+                    resolver = EntityResolver(settings.db_path, repo=gen.repo)
                     closers.append(resolver.close)
                 except Exception as exc:  # noqa: BLE001 - reported, retrieval still works
                     warnings.append(f"entity resolver unavailable: {type(exc).__name__}: {exc}")
@@ -155,10 +162,11 @@ class RetrievalService:
             walker = None
             if graph is None:
                 try:
-                    from entities.temporal_graph import TemporalGraph  # contract class
+                    from entities.temporal_graph import TemporalGraphWalker
 
-                    graph = TemporalGraph(settings.db_path)
-                except Exception as exc:  # noqa: BLE001
+                    graph = TemporalGraphWalker(settings.db_path)  # repo is passed per query
+                    closers.append(graph.close)
+                except Exception as exc:  # noqa: BLE001 - graph is optional; say why it is off
                     warnings.append(f"graph unavailable: {type(exc).__name__}: {exc}")
             if graph is not None:
                 if hasattr(graph, "neighbors"):
@@ -168,7 +176,7 @@ class RetrievalService:
             return cls(
                 chunk_store=chunk_store, retriever=retriever, reranker=reranker,
                 decomposer=decomposer, resolver=resolver, graph_walker=walker,
-                startup_warnings=warnings, closers=closers,
+                startup_warnings=warnings, closers=closers, repo=gen.repo,
             )
         except Exception:
             for close in reversed(closers):
@@ -187,6 +195,10 @@ class RetrievalService:
     def retrieve(
         self, question: str, scope: Scope, top_k: int = 12, limit: int = 40
     ) -> RetrievalOutcome:
+        if self.repo and scope.repo != self.repo:
+            raise ScopeError(
+                f"retrieval service is loaded for {self.repo!r} but the scope names {scope.repo!r}"
+            )
         warnings = list(self.startup_warnings)
         plan = self.decomposer.decompose(question)
         warnings.extend(plan.warnings)
@@ -216,6 +228,7 @@ class RetrievalService:
                 )
         if not candidates:
             candidates = run(scope)
+        warnings.extend(getattr(self.retriever, "branch_notes", []) or [])
 
         graph_paths: list[list[PathHop]] = []
         if self.graph_walker is not None and route.expand_graph and candidates:

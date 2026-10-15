@@ -345,7 +345,8 @@ def make_resolver(records):
 
 
 def rec(name, etype, aliases=()):
-    return SimpleNamespace(canonical_name=name, entity_type=etype, aliases=list(aliases))
+    kind = {"tech": "technology"}.get(etype, etype)  # real EntityRecord exposes .kind
+    return SimpleNamespace(canonical_name=name, entity_type=etype, kind=kind, aliases=list(aliases))
 
 
 def test_resolver_returns_kinds_and_rejects_prefix_false_positives():

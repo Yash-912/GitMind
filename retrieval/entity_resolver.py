@@ -8,9 +8,6 @@ from entities.entity_registry import EntityRegistry
 from generation.llm_client import LLMClient
 
 
-_KIND_ALIASES = {"tech": "technology"}
-
-
 @dataclass(frozen=True)
 class ResolvedEntity:
     name: str      # canonical name (or the raw term when unknown)
@@ -21,8 +18,10 @@ class ResolvedEntity:
 class EntityResolver:
     """Resolve query terms to canonical entities using the registry."""
 
-    def __init__(self, db_path: str, llm: LLMClient | None = None) -> None:
-        self.registry = EntityRegistry(db_path)
+    def __init__(self, db_path: str, llm: LLMClient | None = None, repo: str = "") -> None:
+        # The registry is repo-scoped: without the active repo it sees nothing.
+        self.repo = repo
+        self.registry = EntityRegistry(db_path, repo=repo)
         self.llm = llm or LLMClient()
 
     def resolve(self, terms: list[str]) -> list[str]:
@@ -57,8 +56,7 @@ class EntityResolver:
             if match is None:
                 out.append(ResolvedEntity(name=term, kind="unknown", surface=term))
                 continue
-            raw = getattr(match, "kind", None) or match.entity_type
-            out.append(ResolvedEntity(match.canonical_name, _KIND_ALIASES.get(raw, raw), term))
+            out.append(ResolvedEntity(match.canonical_name, match.kind, term))
         return out
 
     def resolve_from_query_typed(self, query: str) -> list["ResolvedEntity"]:
