@@ -6,8 +6,11 @@
 #
 # Then open http://localhost:7860 for the Streamlit UI
 #      and http://localhost:8000/docs for the FastAPI Swagger UI.
-
-version: "3.9"
+#
+# Single-corpus demo mode: leave ALLOWED_REPOS empty to serve any repository
+# that has a ready index. Set ALLOWED_REPOS=owner/name[,owner/name] to restrict
+# queries and ingestion to those repositories. This is a corpus allow-list, not
+# per-user authorization (API_KEY is one shared secret).
 
 services:
 
@@ -19,12 +22,20 @@ services:
       - "6334:6334"   # gRPC
     volumes:
       - qdrant_storage:/qdrant/storage
+    healthcheck:
+      # The image has no curl/wget; probe the REST port with bash's /dev/tcp.
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
 
   api:
     build: .
     container_name: gitmind-api
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    # No --reload: a code-change reload would kill in-flight ingestion jobs.
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     environment:
@@ -34,6 +45,10 @@ services:
       # SQLite for local dev (no Postgres needed)
       DATABASE_URL: ""
       DB_PATH: data/gitmind.db
+      GENERATIONS_DIR: data/generations
+      JOBS_DB_PATH: data/jobs.db
+      ALLOWED_REPOS: ${ALLOWED_REPOS:-}
+      QUERY_TIMEOUT_S: ${QUERY_TIMEOUT_S:-120}
       # Keys
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
@@ -42,7 +57,15 @@ services:
       - .:/app
       - app_data:/app/data
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      # Liveness only; corpus readiness is GET /ready.
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
 
   frontend:
@@ -61,7 +84,14 @@ services:
     volumes:
       - .:/app
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:7860/_stcore/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
 volumes:

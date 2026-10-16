@@ -77,21 +77,91 @@ Open:
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 
-# Current broad-collection workflow; selective ingestion is planned
-python scripts/ingest.py --github-repo <owner/repo>
-python scripts/run_phase2.py --repo <owner/repo>
-python scripts/run_phase3.py
+# Current broad-collection workflow; selective ingestion is planned.
+# The API's ingestion job runs exactly these three steps, in this order.
+python -u scripts/ingest.py --github-repo <owner/repo>
+python -u scripts/run_phase2.py --repo <owner/repo>
+python -u scripts/run_phase3.py --repo <owner/repo> --generation
 
-# Start API server
-uvicorn api.main:app --port 8000 --reload
+# Start API server (no --reload: a reload would kill running ingestion jobs)
+uvicorn api.main:app --port 8000
 
 # Start Streamlit (in another terminal)
 streamlit run interface/streamlit_app.py
+
+# Command-line retrieval / answers (a repository is always required)
+python scripts/run_retrieval.py "why jwt?" --repo <owner/repo>
+python scripts/run_answer.py "why jwt?" --repo <owner/repo> --mode direct
 ```
 
 ## Configuration
 
 All settings live in `config/settings.py` and are read from environment variables or `.env`.
+API-layer settings:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `API_KEY` | unset | Shared secret for the `X-API-Key` header. Unset = open access. |
+| `ALLOWED_REPOS` | empty | Comma-separated repositories the API may query/ingest. Empty = demo mode (below). |
+| `GENERATIONS_DIR` | `data/generations` | Where published index generations live. |
+| `QUERY_TIMEOUT_S` | `120` | Total budget for one `/query` (retrieval + LLM). |
+| `JOBS_DB_PATH` | `data/jobs.db` | SQLite file holding ingestion jobs. |
+| `JOB_QUEUE_SIZE` / `JOB_TIMEOUT_S` | `8` / `21600` | Per-repo queue bound / total job time budget. |
+
+**Single-corpus demo mode.** With `ALLOWED_REPOS` empty, any repository that has a ready
+index generation can be queried and any resolvable repository can be ingested. Set
+`ALLOWED_REPOS` to restrict both. `API_KEY` is one shared secret for the whole API:
+this is a corpus allow-list and gate, **not** per-user authorization.
+
+## API
+
+- `GET /health` is **liveness only** (the process is up). `GET /ready` is **readiness**: per
+  repository it reports the active generation id, commit, chunk count, embedding identity,
+  whether Qdrant is reachable, which generation providers are configured and whether the
+  reranker is available. Degraded components are listed explicitly; an empty or missing corpus
+  returns `503 not_ready`. `/ready` requires the API key when one is set.
+- `POST /api/v1/query` requires `repo`; optional `time_start`, `time_end`, `doc_types`,
+  `authors`, `modules`, `kind` (`history|snapshot`), `mode` (`direct|memo|blame|risk`),
+  `top_k`, `limit`. Invalid input is rejected with `422` before any retrieval.
+  The response carries `status`, `answer`, structured `data`, and three **separate** source
+  lists: `retrieved` (every candidate), `included` (shown to the model) and `cited`
+  (validated citations), each with an immutable locator (repo, doc type/id, chunk id,
+  timestamp, author, commit, path, line range, URL when the chunk metadata has them).
+
+  | `status` | HTTP | Meaning |
+  |---|---|---|
+  | `answered` | 200 | Valid answer; every citation was in the context shown to the model |
+  | `insufficient_evidence` | 200 | Nothing usable was retrieved; no model call was made |
+  | `provider_unavailable` | 503 | No generation provider responded |
+  | `invalid_output` | 502 | Output failed schema/citation validation |
+
+  Other errors: `503 embedding_unavailable`, `503 index_not_ready`, `504 deadline_exceeded`,
+  `403 repo_not_allowed`, `401` bad API key.
+- `POST /api/v1/ingest` queues a **durable job** (`202`); `GET /api/v1/jobs`,
+  `GET /api/v1/jobs/{id}`, `POST /api/v1/jobs/{id}/cancel`. Jobs are stored in SQLite
+  (`queued|running|succeeded|failed|cancelled`), run one at a time per repository, and a
+  server restart marks jobs that were queued/running as `failed` ("interrupted").
+  On success the API swaps to the newly published generation without restarting.
+- Resources (generation, retrieval service, LLM client) are loaded once at startup, not per
+  request. Blame/risk statistics are computed from the generation's stored chunk records.
+  Memo and blame/risk answers are not citation-validated beyond the memo's `evidence` ids.
+
+## What is verified and what is not
+
+Verified by tests in this repository (all offline, using a fake retrieval service and fake
+LLM — `tests/test_wave2_D4.py`): request validation, status mapping, the retrieved/included/
+cited separation, readiness reporting, job persistence/cancel/serialization/restart, generation
+swap during in-flight requests, allowed-repo and API-key enforcement, the UI HTTP client,
+`start.sh` startup/exit behaviour (with stub binaries), `docker compose config`.
+
+**Not verified:** no Docker image was built and no container was started (no Docker daemon in the
+authoring environment); the Qdrant `/dev/tcp` healthcheck is untested; the Streamlit page was
+not run (Streamlit is not installed in the test venv); `RetrievalService` was tested only through
+a fake (the real one is delivered by the retrieval track); the real `run_phase3.py
+--repo ... --generation` interface that the job runner invokes must match that script;
+nothing was tested against real Gemini, Ollama or Qdrant; `requirements.lock` covers only the
+packages installed in the test venv (see its header) and several `requirements.txt` ranges are
+marked `[unverified]`; the base image is pinned by tag, not digest.
 
 ## Data Stores
 

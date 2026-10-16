@@ -1,52 +1,57 @@
+# Direct dependencies, pinned with ~= (compatible release).
+# Versions marked [verified] match the venv the test suite ran in (see
+# requirements.lock). Versions marked [unverified] are NOT installed in that
+# venv: the ranges are best-effort and must be confirmed in a full install.
+
 # Phase 1 — Data Infrastructure
-gitpython
-PyGithub
-httpx
-tenacity
-sqlmodel
-pydantic-settings
-python-dotenv
+gitpython~=3.2.1                    # [verified]
+PyGithub~=2.10.0                    # [verified]
+httpx~=0.28.1                       # [verified]
+tenacity~=9.1.4                     # [verified]
+sqlmodel~=0.0.48                    # [verified]
+pydantic-settings~=2.16.0           # [verified]
+python-dotenv~=1.2.4                # [verified]
 
 # Phase 2 — Parsing, Entities & Chunking
-unidiff                     # structured diff parsing
-tree-sitter>=0.21           # AST-based code parsing
-tree-sitter-python          # Python grammar for tree-sitter
-spacy>=3.7                  # NER entity extraction (run: python -m spacy download en_core_web_sm)
-rapidfuzz                   # fuzzy entity alias resolution
-markdownify                 # HTML → Markdown conversion
-beautifulsoup4              # HTML parsing fallback
-keybert                     # unsupervised keyphrase extraction
-tiktoken                    # token counting for context assembly
+unidiff~=1.0.1                      # [verified]
+tree-sitter~=0.26.0                 # [verified]
+tree-sitter-python~=0.25.0          # [verified]
+spacy~=3.7                          # [unverified] run: python -m spacy download en_core_web_sm
+rapidfuzz~=3.14.6                   # [verified]
+markdownify~=1.2.3                  # [verified]
+beautifulsoup4~=4.15.0              # [verified]
+keybert~=0.8                        # [unverified]
+tiktoken~=0.14.0                    # [verified]
 
 # Phase 3 — Embedding & Indexing
-qdrant-client>=1.9          # local-mode vector store with named vectors
-bm25s                       # pure-Python BM25 sparse index
-PyStemmer                   # stemmer backend for bm25s
-diskcache                   # persistent embedding cache
+qdrant-client~=1.19.1               # [verified] server image pinned in docker-compose.yml
+bm25s~=0.3.13                       # [verified]
+PyStemmer~=3.1.0                    # [verified]
+diskcache~=5.6.3                    # [verified]
 
 # Phase 5 — Generation
-google-genai
-jinja2
-pydantic
+google-genai~=2.31.0                # [verified]
+jinja2~=3.1.6                       # [verified]
+pydantic~=2.14.1                    # [verified]
 
 # Phase 6 — Evaluation
-ragas
-mlflow
+ragas~=0.2                          # [unverified]
+mlflow~=2.16                        # [unverified]
 
 # Phase 7 — Interface
-streamlit
-typer
+streamlit~=1.40                     # [unverified] UI uses st.fragment(run_every=...) (>=1.37)
+typer~=0.12                         # [unverified]
 
 # Optional — Reranker
-sentence-transformers
+sentence-transformers~=3.0          # [unverified]
 
 # Dev / Testing
-pytest
-pytest-asyncio
+pytest~=9.1.1                       # [verified]
+pytest-asyncio~=0.23                # [unverified]
 
 # Production — API server
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
+fastapi~=0.143.2                    # [verified]
+uvicorn[standard]~=0.54.0           # [verified: uvicorn; "standard" extras unverified]
 
 # Production — PostgreSQL support (for Neon / Supabase)
-psycopg2-binary
+psycopg2-binary~=2.9                # [unverified]
