@@ -579,3 +579,35 @@ class TestQdrant:
         f = QdrantStore.build_filter(doc_types=["commit"], author="alice",
                                      time_start="2023-01-01", time_end="2023-12-31")
         assert len(f.must) == 3 and QdrantStore.build_filter() is None
+
+
+class TestRerunDropsStaleChunks:
+    def test_second_generation_removes_dropped_chunks_everywhere(self, env):
+        gen1 = env.new_gen()                               # chunk-0 .. chunk-3
+        assert env.run(gen1, make_client(FakeOllama()), keep=1) == 0
+
+        gen2 = env.new_gen(chunk_dicts(2))                 # chunk-0, chunk-1 only
+        assert env.run(gen2, make_client(FakeOllama()), keep=1) == 0
+        assert env.mgr.active_id() == gen2.generation_id
+        active = env.mgr.active()
+
+        bm25_ids = {h.chunk_id for h in
+                    BM25Index(str(active.bm25_dir)).search("authentication", limit=50)}
+
+        fts = FTSIndex(str(active.fts_path), read_only=True)
+        fts_ids = {h.chunk_id for h in fts.search("authentication", limit=50)}
+        fts_count = fts.count()
+        fts.close()
+
+        store = QdrantStore(path=env.qdrant, collection=active.qdrant_collection,
+                            embedding=active.embedding)
+        points, _ = store.client.scroll(collection_name=active.qdrant_collection,
+                                        limit=100, with_payload=True)
+        qdrant_ids = {p.payload["chunk_id"] for p in points}
+        store.close()
+
+        expected = {"chunk-0", "chunk-1"}
+        assert bm25_ids == fts_ids == qdrant_ids == expected
+        assert fts_count == 2
+        assert not gen1.path.exists()                       # old generation pruned
+        assert env.collections() == [active.qdrant_collection]
