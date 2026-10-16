@@ -319,6 +319,73 @@ def e2e(tmp_path_factory):
     )
 
 
+SEMANTIC = {"provider": "ollama", "model": "nomic-embed-text", "dim": 768, "version": ""}
+
+
+class TestRealIndexReaders:
+    """from_generation opens the real D2 readers on temp paths (no shared Qdrant path)."""
+
+    def _local_qdrant(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(settings, "qdrant_url", None, raising=False)
+        return str(tmp_path / "qdrant")
+
+    def test_real_readers_open_and_scope_allowed_ids_apply_before_limit(self, tmp_path, monkeypatch):
+        from indexing.qdrant_store import QdrantStore
+
+        qpath = self._local_qdrant(tmp_path, monkeypatch)
+        emb = {"semantic": SEMANTIC, "code": None}
+        seed = QdrantStore(path=qpath, collection="gitmind_col", embedding=emb)
+        seed.close()
+
+        records = [
+            _chunk("a_jwt", ALPHA, "commit_a", "alpha JWT token fix"),
+            _chunk("b_jwt", BETA, "commit_b", "beta JWT token rewrite"),
+        ]
+        fts_path = tmp_path / "fts.db"
+        fts = FTSIndex(str(fts_path))
+        fts.add_chunks(records)
+        fts.close()
+
+        gen = SimpleNamespace(
+            repo=ALPHA, embedding=emb, chunks_path=_write(tmp_path / "c.jsonl", records),
+            bm25_dir=tmp_path / "bm25", fts_path=fts_path, qdrant_collection="gitmind_col",
+        )
+        class DimEmbedder(FakeEmbedder):  # the local Qdrant collection is 768-dimensional
+            def embed(self, text):
+                return [1.0] + [0.0] * 767
+
+        svc = RetrievalService.from_generation(
+            gen, SimpleNamespace(qdrant_path=qpath, db_path=str(tmp_path / "g.db")),
+            embedder=DimEmbedder(), reranker=CrossEncoderReranker(model=FakeModel()),
+            decomposer=FixedDecomposer(), resolver=NoEntities(),
+            graph=TemporalGraphWalker(str(tmp_path / "g.db")),
+        )
+        try:
+            assert svc.retriever.qdrant.collection_name == "gitmind_col"
+            out = svc.retrieve("JWT token", Scope.build(ALPHA))
+            assert set(out.retrieved_ids) == {"a_jwt"}  # beta record excluded by allowed_ids
+        finally:
+            svc.close()
+
+    def test_qdrant_identity_mismatch_is_raised_on_open(self, tmp_path, monkeypatch):
+        from embedding.models import EmbeddingIdentityMismatchError
+        from indexing.qdrant_store import QdrantStore
+
+        qpath = self._local_qdrant(tmp_path, monkeypatch)
+        QdrantStore(path=qpath, collection="gitmind_col", embedding={"semantic": SEMANTIC}).close()
+        other = dict(SEMANTIC, model="some-other-model")
+        FTSIndex(str(tmp_path / "fts.db")).close()  # read-only open requires the file to exist
+        gen = SimpleNamespace(
+            repo=ALPHA, embedding={"semantic": other}, chunks_path=_write(tmp_path / "c.jsonl", []),
+            bm25_dir=tmp_path / "bm25", fts_path=tmp_path / "fts.db", qdrant_collection="gitmind_col",
+        )
+        with pytest.raises(EmbeddingIdentityMismatchError):
+            RetrievalService.from_generation(
+                gen, SimpleNamespace(qdrant_path=qpath, db_path=str(tmp_path / "g.db")),
+                embedder=FakeEmbedder(),
+            )
+
+
 class TestEndToEnd:
     def _service(self, e2e, repo=ALPHA, intent="why"):
         cs = ChunkStore(e2e.mixed_path)

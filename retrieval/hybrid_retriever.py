@@ -8,12 +8,35 @@ from indexing.qdrant_store import QdrantStore
 from indexing.bm25_index import BM25Index
 from indexing.fts_index import FTSIndex
 
+from .scope import to_utc
 from .types import CandidateChunk
 from .chunk_store import ChunkStore
 from .query_embedder import QueryEmbedder
 
 PERSON_BOOST = 1.15
-OVERFETCH = 5  # branch over-fetch factor when it cannot pre-filter by scope
+
+
+def _legacy_matches(meta: dict[str, Any], filters: dict[str, Any]) -> bool:
+    """Same predicate as Scope.matches, for the unscoped ``filters=`` dict."""
+    doc_types = filters.get("doc_types")
+    if doc_types and meta.get("doc_type") not in doc_types:
+        return False
+    author = filters.get("author")
+    if author and meta.get("author") != author:
+        return False
+    module_tags = filters.get("module_tags")
+    if module_tags and not set(module_tags) & set(meta.get("module_tags") or []):
+        return False
+    if filters.get("time_start") or filters.get("time_end"):
+        ts = to_utc(meta.get("timestamp"))
+        if ts is None:
+            return False
+        start, end = to_utc(filters.get("time_start")), to_utc(filters.get("time_end"))
+        if start and ts < start:
+            return False
+        if end and ts > end:
+            return False
+    return True
 
 
 class HybridRetriever:
@@ -52,17 +75,6 @@ class HybridRetriever:
             "fts": 0.6,
         }
         self._allowed_cache: dict[Any, frozenset[str]] = {}
-        self.branch_notes: list[str] = []   # degradations of the last retrieve_many call
-
-    @staticmethod
-    def _accepts_allowed_ids(index: Any) -> bool:
-        try:
-            params = inspect.signature(index.search).parameters
-        except (TypeError, ValueError):
-            return False
-        return "allowed_ids" in params or any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
 
     # ------------------------------------------------------------------ scope
 
@@ -136,19 +148,11 @@ class HybridRetriever:
                 time_start=filters.get("time_start") if filters else None,
                 time_end=filters.get("time_end") if filters else None,
             )
-        self.branch_notes = []
-
-        def sparse(name: str, index: Any, query: str) -> list[Any]:
-            """Search a sparse branch, pre-filtering by allowed ids when it supports it."""
+        def sparse(index: Any, query: str) -> list[Any]:
+            """Sparse branch; allowed ids are applied before the limit (filter-then-rank)."""
             if allowed is None:
                 return index.search(query, limit=limit)
-            if self._accepts_allowed_ids(index):
-                return index.search(query, limit=limit, allowed_ids=allowed)
-            note = (f"{name} index cannot pre-filter by scope; over-fetching and filtering after "
-                    "retrieval (recall may be reduced under narrow scopes)")
-            if note not in self.branch_notes:
-                self.branch_notes.append(note)
-            return index.search(query, limit=limit * OVERFETCH)
+            return index.search(query, limit=limit, allowed_ids=allowed)
 
         branch_lists: list[tuple[str, list[Any]]] = []
         for query in dict.fromkeys(q for q in queries if q and q.strip()):
@@ -162,8 +166,8 @@ class HybridRetriever:
                     ("qdrant_code",
                      self.qdrant.search_code(query_vector=vec, limit=limit, query_filter=q_filter))
                 )
-            branch_lists.append(("bm25", sparse("bm25", self.bm25, query)))
-            branch_lists.append(("fts", sparse("fts", self.fts, query)))
+            branch_lists.append(("bm25", sparse(self.bm25, query)))
+            branch_lists.append(("fts", sparse(self.fts, query)))
 
         scores: dict[str, float] = defaultdict(float)
         sources: dict[str, str] = {}
@@ -183,6 +187,8 @@ class HybridRetriever:
             meta = record.get("metadata", {})
             # Authoritative final check: a branch that ignored its filter cannot leak.
             if scope is not None and not scope.matches(meta):
+                continue
+            if scope is None and filters and not _legacy_matches(meta, filters):
                 continue
             score *= weights.get(meta.get("doc_type", ""), 1.0)
             if boosts:

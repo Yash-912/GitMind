@@ -218,6 +218,20 @@ def test_scope_matching_nothing_returns_empty(tmp_path):
     assert r.retrieve("x", scope=Scope.build("nope/none")) == []
 
 
+def test_legacy_filters_path_rejects_chunks_failing_every_filter(tmp_path):
+    """Unscoped filters= must be enforced after fusion, not only on the dense branch."""
+    cs = store(tmp_path, [
+        mk("good", doc_type="commit", author="alice", ts="2023-03-01T00:00:00", modules=("core",)),
+        mk("excluded", doc_type="issue", author="bob", ts="2019-01-01T00:00:00", modules=("ui",)),
+    ])
+    r = retriever(cs, bm25=FakeSparse(default=["good", "excluded"]))
+    out = r.retrieve("x", filters={
+        "doc_types": ["commit"], "author": "alice", "module_tags": ["core"],
+        "time_start": "2023-01-01T00:00:00",
+    })
+    assert [c.chunk_id for c in out] == ["good"]
+
+
 def test_legacy_qdrant_keyword_filter_signature_still_works(tmp_path):
     class LegacyQdrant(FakeQdrant):
         def build_filter(self, doc_types=None, module_tags=None, author=None, time_start=None, time_end=None):
@@ -585,13 +599,13 @@ SETTINGS = SimpleNamespace(qdrant_path="x", db_path="y")
 def test_identity_mismatch_raises_and_is_not_swallowed():
     emb = QueryEmbedder(expected_identity=IDENT, client=FakeClient(EmbeddingIdentityMismatchError("provider changed")))
     with pytest.raises(EmbeddingIdentityMismatchError, match="provider changed"):
-        RetrievalService.from_generation(bare_gen(IDENT), SETTINGS, embedder=emb)
+        RetrievalService.from_generation(bare_gen({"semantic": IDENT}), SETTINGS, embedder=emb)
 
 
 def test_embedding_provider_unavailable_raises_typed_error():
     emb = QueryEmbedder(expected_identity=IDENT, client=FakeClient(EmbeddingUnavailableError("ollama down")))
     with pytest.raises(EmbeddingUnavailableError):
-        RetrievalService.from_generation(bare_gen(IDENT), SETTINGS, embedder=emb)
+        RetrievalService.from_generation(bare_gen({"semantic": IDENT}), SETTINGS, embedder=emb)
 
 
 def test_generation_without_recorded_identity_is_rejected():
