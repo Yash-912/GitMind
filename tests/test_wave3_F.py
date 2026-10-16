@@ -362,3 +362,38 @@ def test_phase2_prints_extractor(tmp_path, capsys):
     store.close()
     run_phase2("o/p", db_path=db, data_dir=tmp_path / "d")
     assert "Entity extractor:" in capsys.readouterr().out
+
+
+# ============================================ phase 3 stores are per generation
+
+def test_new_generation_indexes_hold_only_its_own_chunks(tmp_path):
+    """Phase 3 builds BM25 and FTS in each generation's own directory from the
+    generation's chunks. Ids that a later generation drops must not be found in
+    it, so stale chunks cannot reach retrieval after a re-run."""
+    from indexing.bm25_index import BM25Index
+    from indexing.fts_index import FTSIndex
+
+    old_ids = ["c-old-1", "c-old-2", "c-shared"]
+    old_texts = ["removed pull request text", "another removed text", "shared text about auth"]
+    new_ids = ["c-shared", "c-new"]
+    new_texts = ["shared text about auth", "fresh text about billing"]
+
+    old_bm = BM25Index(str(tmp_path / "gen_old" / "bm25"))
+    old_bm.build(old_ids, old_texts)
+    new_bm = BM25Index(str(tmp_path / "gen_new" / "bm25"))
+    new_bm.build(new_ids, new_texts)
+    assert new_bm.size == len(new_ids)
+    hits = {r.chunk_id if hasattr(r, "chunk_id") else r[0] for r in new_bm.search("removed pull request")}
+    assert not hits & {"c-old-1", "c-old-2"}
+
+    fts_new = FTSIndex(str(tmp_path / "gen_new" / "fts.db"))
+    try:
+        fts_new.add_chunks([
+            {"text": t, "metadata": {"chunk_id": i, "doc_type": "commit", "repo": ALPHA}}
+            for i, t in zip(new_ids, new_texts)
+        ])
+        assert fts_new.count() == len(new_ids)
+        found = {r.chunk_id for r in fts_new.search("removed")}
+        assert not found & {"c-old-1", "c-old-2"}
+    finally:
+        fts_new.close()
