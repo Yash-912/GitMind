@@ -14,7 +14,8 @@ from config.settings import settings
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "generations_dir", str(tmp_path / "gens"))
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "generations_dir", str(tmp_path / "data" / "generations"))
     monkeypatch.setattr(settings, "jobs_db_path", str(tmp_path / "jobs.db"))
     monkeypatch.setattr(settings, "allowed_repos", [])
     monkeypatch.setattr(settings, "api_key", None)
