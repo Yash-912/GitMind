@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from parsing.multi_schema_parser import extract_closing_refs, extract_issue_refs
+
 from .github_collector import IssueRecord, PullRequestRecord
 from .git_collector import CommitRecord
 
@@ -28,10 +30,16 @@ def _link_id(
 
 
 class CrossReferenceLinker:
-    issue_pattern = re.compile(r"(?<![\w/])#(\d+)")
-    closes_pattern = re.compile(
-        r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE
-    )
+    """Derives links between commits, PRs and issues.
+
+    Reference extraction uses the shared repo-aware parser
+    (``parsing.multi_schema_parser``): code fences, inline code, URLs and
+    references to other repositories never create local links. Pass ``repo``
+    (``owner/name``) so qualified references to this repository still resolve.
+    """
+
+    def __init__(self, repo: str = "") -> None:
+        self.repo = repo
 
     def link_prs_to_issues(
         self, prs: Iterable[PullRequestRecord], issues: Iterable[IssueRecord]
@@ -39,9 +47,12 @@ class CrossReferenceLinker:
         issue_map = {str(issue.number): issue for issue in issues}
         links: list[LinkRecord] = []
         for pr in prs:
-            matches = self.issue_pattern.findall(
-                pr.body or ""
-            ) + self.issue_pattern.findall(pr.title or "")
+            matches = [
+                str(n)
+                for n in extract_issue_refs(
+                    f"{pr.title or ''}\n{pr.body or ''}", self.repo
+                )[0]
+            ]
             for issue_id in set(matches):
                 if issue_id in issue_map:
                     links.append(
@@ -57,7 +68,8 @@ class CrossReferenceLinker:
                         )
                     )
             if pr.merged_at:
-                for issue_id in set(self.closes_pattern.findall(pr.body or "")):
+                for n in extract_closing_refs(pr.body or "", self.repo):
+                    issue_id = str(n)
                     if issue_id in issue_map:
                         links.append(
                             LinkRecord(
@@ -121,7 +133,8 @@ class CrossReferenceLinker:
         issue_ids = {str(issue.number) for issue in issues}
         links = []
         for commit in commits:
-            for issue_id in set(self.issue_pattern.findall(commit.message)) & issue_ids:
+            refs = {str(n) for n in extract_issue_refs(commit.message, self.repo)[0]}
+            for issue_id in refs & issue_ids:
                 links.append(
                     LinkRecord(
                         _link_id("commit", commit.sha, "issue", issue_id, "references"),

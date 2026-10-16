@@ -144,6 +144,34 @@ def extract_issue_refs(text: str, local_repo: str = "") -> tuple[list[int], list
     return sorted(local), list(foreign)
 
 
+_CLOSE_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)[:\s]+"
+    r"(?:https?://github\.com/(?P<urepo>[\w.-]+/[\w.-]+)/(?:issues|pull)/(?P<unum>\d+)"
+    r"|(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<num>\d+)(?!\w))",
+    re.IGNORECASE,
+)
+
+
+def strip_code(text: str) -> str:
+    """``text`` without code fences, inline code and HTML comments."""
+    return _CODE_RE.sub(" ", text or "")
+
+
+def extract_closing_refs(text: str, local_repo: str = "") -> list[int]:
+    """Local issue numbers closed by keyword (``fixes #N``, ``closes owner/repo#N``…).
+
+    Uses the same code/URL/foreign-repo rules as :func:`extract_issue_refs`:
+    only references resolving to ``local_repo`` (or unqualified) are returned.
+    """
+    out: dict[int, None] = {}
+    for m in _CLOSE_RE.finditer(strip_code(text)):
+        repo = m.group("urepo") or m.group("repo")
+        if repo and repo.lower() != (local_repo or "").lower():
+            continue
+        out[int(m.group("unum") or m.group("num"))] = None
+    return list(out)
+
+
 def _closing_numbers(payload: dict[str, Any]) -> list[int]:
     """Closing issue numbers; falls back to parsing ``#N`` for old payloads."""
     numbers = payload.get("closing_issue_numbers")

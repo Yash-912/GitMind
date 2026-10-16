@@ -45,7 +45,17 @@ class EntityExtractor:
     """
 
     def __init__(self, spacy_model: str = "en_core_web_sm") -> None:
+        self._backend = "regex-only"
         self._nlp = self._load_spacy(spacy_model)
+
+    def describe(self) -> str:
+        """Which extractor is active — printed by phase 2 so degraded NER is visible."""
+        if self._nlp is not None:
+            return self._backend
+        return (
+            f"{self._backend} — PERSON/ORG named-entity recognition is OFF; only "
+            "tech keywords, authors and path-derived modules are tagged"
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -110,14 +120,20 @@ class EntityExtractor:
             import spacy  # type: ignore
 
             try:
-                return spacy.load(model)
+                nlp = spacy.load(model)
+                self._backend = f"spaCy ({model}) + regex tech keywords"
+                return nlp
             except OSError:
                 # Try smaller fallback
                 try:
-                    return spacy.load("en_core_web_sm")
+                    nlp = spacy.load("en_core_web_sm")
+                    self._backend = "spaCy (en_core_web_sm) + regex tech keywords"
+                    return nlp
                 except OSError:
+                    self._backend = f"regex-only (spaCy installed but model {model!r} is missing)"
                     return None
         except ImportError:
+            self._backend = "regex-only (spaCy not installed)"
             return None
 
     def _extract_spacy(

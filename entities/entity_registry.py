@@ -99,7 +99,47 @@ class EntityRegistry:
         self._conn = _get_connection(db_path)
         # (kind, canonical_name) → EntityRecord, for this repo only
         self._cache: dict[tuple[str, str], EntityRecord] = {}
+        self._tracking = False
+        self._run_seen: set[tuple[str, str]] = set()
+        self._run_refs: set[tuple[str, str, DocRef]] = set()
         self._setup_tables()
+
+    # ------------------------------------------------------------------
+    # Re-run bookkeeping: remove what a run no longer emits
+    # ------------------------------------------------------------------
+
+    def begin_run(self) -> None:
+        """Start tracking entities / document references re-emitted by this run."""
+        self._tracking = True
+        self._run_seen = set()
+        self._run_refs = set()
+
+    def prune_stale(self) -> dict[str, int]:
+        """Drop this repo's doc references (and entities left without any) that the
+        run did not re-emit. Other repositories are never touched."""
+        if not self._tracking:
+            raise RuntimeError("prune_stale() requires begin_run()")
+        refs_removed = entities_removed = 0
+        for key, record in list(self._cache.items()):
+            keep = [r for r in record.doc_refs if (key[0], key[1], r) in self._run_refs]
+            refs_removed += len(record.doc_refs) - len(keep)
+            if not keep and key not in self._run_seen:
+                self._conn.execute(
+                    "DELETE FROM entities WHERE repo = ? AND kind = ? AND canonical_name = ?",
+                    (self.repo, key[0], key[1]),
+                )
+                self._conn.execute(
+                    "DELETE FROM entity_index WHERE entity_name = ? AND repo = ? AND kind = ?",
+                    (key[1], self.repo, key[0]),
+                )
+                del self._cache[key]
+                entities_removed += 1
+            elif len(keep) != len(record.doc_refs):
+                record.doc_refs = keep
+                record.doc_ids = list(dict.fromkeys(r.doc_id for r in keep))
+                self._persist(record)
+        self._conn.commit()
+        return {"doc_refs_removed": refs_removed, "entities_removed": entities_removed}
 
     # ------------------------------------------------------------------
     # Setup
@@ -212,6 +252,8 @@ class EntityRegistry:
                 canonical.lower() == surface_lower
                 or surface_lower in [a.lower() for a in record.aliases]
             ):
+                if self._tracking:
+                    self._run_seen.add((rec_kind, canonical))
                 return canonical
 
         # 2. Fuzzy match via rapidfuzz — only for technologies / concepts; people,
@@ -221,6 +263,8 @@ class EntityRegistry:
             canonical = self._fuzzy_match(surface_form, kind)
             if canonical:
                 self._add_alias(kind, canonical, surface_form)
+                if self._tracking:
+                    self._run_seen.add((kind, canonical))
                 return canonical
 
         # 3. Register as new entity
@@ -239,6 +283,8 @@ class EntityRegistry:
         doc_ids = doc_ids or []
         kind = normalize_kind(entity_type)
         key = (kind, canonical_name)
+        if self._tracking:
+            self._run_seen.add(key)
 
         if key in self._cache:
             record = self._cache[key]
@@ -269,6 +315,9 @@ class EntityRegistry:
         if record is None:
             record = self.register(canonical_name, kind or "concept")
         ref = DocRef(self.repo, doc_type, str(doc_id))
+        if self._tracking:
+            self._run_seen.add((record.kind, record.canonical_name))
+            self._run_refs.add((record.kind, record.canonical_name, ref))
         changed = False
         if str(doc_id) not in record.doc_ids:
             record.doc_ids.append(str(doc_id))

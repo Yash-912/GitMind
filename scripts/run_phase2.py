@@ -44,7 +44,10 @@ from entities.tagging import (
     split_tags,
     stamp_tags,
 )
-from indexing.generation import GenerationManager
+from contextlib import nullcontext
+
+from indexing.generation import BUILDING, Generation, GenerationManager
+from scripts.run_snapshot import merge_into_generation, read_jsonl, run_snapshot
 from chunking import (
     CommitChunker,
     DiffChunker,
@@ -102,15 +105,40 @@ def _iso(dt) -> str | None:
     return dt.isoformat() if dt else None
 
 
-def write_chunks_atomically(path: Path, chunks: list[Chunk]) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        for chunk in chunks:
-            record = {"text": chunk.text, "metadata": chunk.metadata.to_dict()}
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+def _open_building(mgr: GenerationManager, generation_id: str) -> Generation:
+    gen = Generation.load(mgr.base / generation_id)
+    if gen.repo != mgr.repo:
+        raise ValueError("generation belongs to a different repository")
+    if gen.status != BUILDING:
+        raise ValueError(f"generation {generation_id} is {gen.status!r}, not building")
+    return gen
+
+
+def _register_snapshot(records: list[dict], registry: EntityRegistry, graph: TemporalGraphBuilder, repo: str) -> dict[str, int]:
+    """Module/symbol entities and ``file_<path>`` nodes for snapshot (code) chunks."""
+    modules: dict[tuple[str, str], None] = {}
+    symbols: dict[tuple[str, str], None] = {}
+    files: dict[str, None] = {}
+    for rec in records:
+        m = rec.get("metadata", {})
+        path = m.get("source_path") or m.get("doc_id", "")
+        if not path:
+            continue
+        files[path] = None
+        for tag in m.get("module_tags", []):
+            modules[(tag, path)] = None
+        for name in m.get("entity_tags", []):
+            if name:
+                symbols[(name, path)] = None
+    for path in files:
+        graph.add_node("file", path, repo=repo)
+    for name, path in modules:
+        registry.register(name, "module")
+        registry.add_doc_reference(name, path, doc_type="code", kind="module")
+    for name, path in symbols:
+        registry.register(name, "symbol")
+        registry.add_doc_reference(name, path, doc_type="code", kind="symbol")
+    return {"files": len(files), "modules": len({n for n, _ in modules}), "symbols": len({n for n, _ in symbols})}
 
 
 def _tag_document(
@@ -138,8 +166,17 @@ def run_phase2(
     *,
     db_path: str | None = None,
     data_dir: str | Path | None = None,
+    generation_id: str | None = None,
+    repo_path: str | Path | None = None,
+    ref: str = "HEAD",
 ) -> str:
-    """Run phase 2 for one repository and return the new generation id."""
+    """Run phase 2 for one repository and return the generation id it wrote.
+
+    ``generation_id`` writes into an existing *building* generation instead of
+    creating one. ``repo_path`` also rebuilds the current-code (snapshot) view at
+    ``ref`` through run_snapshot's shared merge logic. Without ``repo_path`` a new
+    generation carries the active generation's snapshot records forward unchanged.
+    """
     print("=" * 60)
     print("GitMind — Phase 2: Parsing, Entities & Chunking")
     print("=" * 60)
@@ -153,8 +190,12 @@ def run_phase2(
         print("WARNING: Legacy documents have no verified repository identity.")
     parser = MultiSchemaParser()
     extractor = EntityExtractor()
+    print(f"Entity extractor: {extractor.describe()}")
     registry = EntityRegistry(db_path, repo=repo)
     graph_builder = TemporalGraphBuilder(db_path)
+    # Everything this run emits is tracked; stale edges/entities are pruned at the end.
+    registry.begin_run()
+    graph_builder.begin_run(repo)
 
     chunkers = {
         "commit": CommitChunker(),
@@ -187,6 +228,14 @@ def run_phase2(
         pc = parser.parse_commit(payload)
         parsed_commits.append(pc)
         node_times[f"commit_{pc.sha}"] = pc.timestamp.isoformat()
+
+        # History ↔ code: the commit touches each file it changed (file_<path> node).
+        for path in pc.file_paths:
+            graph_builder.add_edge(
+                "commit", pc.sha, "file", path, "touches", repo=repo,
+                event_time=pc.timestamp.isoformat(),
+                source_doc=f"commit_{pc.sha}",
+            )
 
         chunks = chunkers["commit"].chunk(pc, repo=repo)
         chunks += chunkers["diff"].chunk(pc, repo=repo)
@@ -315,20 +364,62 @@ def run_phase2(
 
     print(f"  Graph edges: {graph_builder.edge_count(repo)}")
 
-    # ------------------------------------------------------------------ Write chunks
+    # ------------------------------------------------------------------ Write generation
     mgr = GenerationManager(root=data_dir / "generations", repo=repo)
-    with mgr.build(commit=pinned_sha(store, repo)) as gen:
-        write_chunks_atomically(gen.chunks_path, all_chunks)
-        gen.chunk_count = len(all_chunks)
+    created = generation_id is None
+    gen_ctx = mgr.build(commit=pinned_sha(store, repo)) if created else nullcontext(
+        _open_building(mgr, generation_id)
+    )
+    with gen_ctx as gen:
+        # History is always rebuilt. Snapshot records are only replaced when this
+        # run rebuilds them (repo_path); otherwise an existing generation keeps its
+        # own, and a new one carries the active generation's code view forward.
+        carried = None
+        active = mgr.active()
+        if created and repo_path is None and active is not None:
+            carried = [r for r in read_jsonl(active.chunks_path) if _is_snapshot(r)]
+        history_records = [
+            {"text": c.text, "metadata": c.metadata.to_dict()} for c in all_chunks
+        ]
+        merge_into_generation(gen, history_records, carried)
+
+        snapshot_stats = None
+        if repo_path is not None:
+            report = run_snapshot(
+                repo_path, repo, ref=ref, data_dir=data_dir,
+                generation_id=gen.generation_id,
+            )
+            gen.commit = report["commit"]
+            gen.save_manifest()
+            print(
+                f"Snapshot {report['commit'][:10]}: {report['selected_files']} files, "
+                f"{report['chunks']['snapshot_total']} code chunks"
+                + ("" if report["complete"] else " (INCOMPLETE: " + "; ".join(report["stops"]) + ")")
+            )
+
+        snapshot_records = [r for r in read_jsonl(gen.chunks_path) if _is_snapshot(r)]
+        snapshot_stats = _register_snapshot(snapshot_records, registry, graph_builder, repo)
+
+        # Remove what this run no longer emits (per repository only).
+        graph_pruned = graph_builder.prune_stale()
+        registry_pruned = registry.prune_stale()
+
+        total = len(all_chunks) + len(snapshot_records)
+        gen.chunk_count = total
         gen.extra["phase2"] = {
-            "chunks": len(all_chunks),
+            "history_chunks": len(all_chunks),
+            "snapshot_chunks": len(snapshot_records),
+            "snapshot_entities": snapshot_stats,
             "graph_edges": graph_builder.edge_count(repo),
             "entities": len(registry.all_entities()),
+            "extractor": extractor.describe(),
+            "pruned": {"graph": graph_pruned, "registry": registry_pruned},
         }
         gen.save_manifest()  # stays "building": phase 3 marks ready and publishes
 
     print(f"\n✅ Phase 2 complete!")
-    print(f"   Total chunks: {len(all_chunks)}")
+    print(f"   History chunks: {len(all_chunks)}, code (snapshot) chunks: {len(snapshot_records)}")
+    print(f"   Stale removed: graph {graph_pruned}, registry {registry_pruned}")
     print(f"   Chunks written to: {gen.chunks_path}")
     print(f"   Entity registry entries: {len(registry.all_entities())}")
     print(f"   Graph edges: {graph_builder.edge_count(repo)}")
@@ -341,10 +432,26 @@ def run_phase2(
     return gen.generation_id
 
 
+def _is_snapshot(record: dict) -> bool:
+    return record.get("metadata", {}).get("scope") == "snapshot"
+
+
 if __name__ == "__main__":
     args_parser = argparse.ArgumentParser(description="Parse and chunk one ingested repository")
     args_parser.add_argument("--repo", help="Repository identity; use 'legacy' only for old unscoped data")
+    args_parser.add_argument("--generation", default=None,
+                             help="write into this existing building generation instead of a new one")
+    args_parser.add_argument("--repo-path", default=None,
+                             help="local clone; also rebuilds the current-code (snapshot) view at --ref")
+    args_parser.add_argument("--ref", default="HEAD", help="commit/branch for the snapshot")
     args = args_parser.parse_args()
+    if args.ref != "HEAD" and not args.repo_path:
+        args_parser.error("--ref requires --repo-path")
     t0 = time.time()
-    run_phase2(args.repo)
+    run_phase2(
+        args.repo,
+        generation_id=args.generation,
+        repo_path=args.repo_path,
+        ref=args.ref,
+    )
     print(f"\n   Elapsed: {time.time() - t0:.1f}s")
