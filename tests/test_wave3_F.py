@@ -142,13 +142,15 @@ class TestSnapshotFirstClass:
     def test_module_and_symbol_entities_from_code(self, code_run):
         reg = EntityRegistry(code_run.db, repo=ALPHA)
         try:
-            mod = reg.get("auth", "module")
+            # snapshot module tags: first path segment and first two segments
+            mod = reg.get("src/auth", "module")
             assert mod is not None and mod.kind == "module"
             assert any(r.doc_type == "code" and r.doc_id == LOGIN_PATH for r in mod.doc_refs)
+            assert reg.get("src", "module") is not None
             sym = reg.get("verify_token", "symbol")
             assert sym is not None and sym.kind == "symbol"
             modules = {r.canonical_name for r in reg.modules()}
-            assert "auth" in modules and "verify_token" not in modules
+            assert {"src", "src/auth"} <= modules and "verify_token" not in modules
         finally:
             reg.close()
 
