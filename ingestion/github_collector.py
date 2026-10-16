@@ -161,6 +161,12 @@ class GitHubAPICollector:
         )
         if rate.remaining <= 1:
             sleep_for = max(rate.reset.timestamp() - time.time(), 0) + 1
+            # Without a token the quota is tiny (60/h); waiting for it would look like a hang.
+            if not self.token and sleep_for > 60:
+                raise RuntimeError(
+                    f"GitHub rate limit reached for unauthenticated requests; resets in "
+                    f"{int(sleep_for // 60)} min. Set GITHUB_TOKEN to continue."
+                )
             time.sleep(sleep_for)
 
     def _iter_with_throttle(self, iterator: Iterable) -> Iterable:
