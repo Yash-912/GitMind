@@ -142,7 +142,8 @@ def _cutoff(value: str | None) -> datetime | None:
 
 class GitHubAPICollector:
     def __init__(self, token: str, repo_full_name: str) -> None:
-        self.client = Github(token, per_page=100)
+        # Public repositories can be read without a token (lower rate limit).
+        self.client = Github(token, per_page=100) if token else Github(per_page=100)
         self.repo = self.client.get_repo(repo_full_name)
         self.token = token
         self.repo_full_name = repo_full_name
