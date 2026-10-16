@@ -193,3 +193,24 @@ def test_scope_excludes_candidate_from_every_branch():
     )
     results = retriever.retrieve("test", scope=scope)
     assert "excluded" not in [r.chunk_id for r in results]
+
+
+def test_legacy_filters_path_excludes_candidate_failing_every_filter():
+    """Unscoped filters= must be enforced after fusion on every branch, not only dense."""
+    excluded = {"text": "Excluded issue", "metadata": {
+        "chunk_id": "excluded", "doc_type": "issue", "author": "bob", "repo": "owner/repo",
+        "timestamp": "1999-01-01T00:00:00+00:00", "module_tags": ["payments"], "scope": "history",
+    }}
+    retriever = HybridRetriever(
+        qdrant=SimpleNamespace(search_semantic=lambda **kwargs: []),
+        bm25=SimpleNamespace(search=lambda *a, **k: [SimpleNamespace(chunk_id="excluded")]),
+        fts=SimpleNamespace(search=lambda *a, **k: [SimpleNamespace(chunk_id="excluded")]),
+        chunk_store=_Store([excluded]),
+        embedder=SimpleNamespace(embed=lambda text: [1.0]),
+        use_code_search=False,
+    )
+    results = retriever.retrieve("test", filters={
+        "doc_types": ["commit"], "author": "alice", "module_tags": ["auth"],
+        "time_start": "2023-01-01T00:00:00",
+    })
+    assert "excluded" not in [r.chunk_id for r in results]
