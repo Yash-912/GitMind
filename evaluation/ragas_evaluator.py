@@ -152,11 +152,19 @@ class RagasEvaluator:
         backend: Any = None,
         pipeline_runner: PipelineRunner | None = None,
         logger: Any = None,
+        repo: str | None = None,
+        generation_root: str | None = None,
     ) -> None:
         self.config = config or RagasConfig.from_settings()
         self._backend = backend
         self._pipeline_runner = pipeline_runner
         self.logger = logger
+        self.repo = repo
+        if generation_root is None:
+            from config.settings import settings
+
+            generation_root = str(Path(settings.data_dir) / "generations")
+        self.generation_root = generation_root
         self.last_report: EvalReport | None = None
 
     @property
@@ -233,27 +241,28 @@ class RagasEvaluator:
         return dict(merged)
 
     def _run_pipeline(self, pairs: list[dict]) -> tuple[list[EvalResult], dict]:
+        """Scoped production retrieval over the repository's active generation.
+
+        Refuses to run without a repository and a published generation, so
+        evaluation never retrieves across repositories or from unpublished data.
+        """
+        import time
+
+        from config.settings import settings
         from generation.direct_qa import DirectQAGenerator
-        from indexing.bm25_index import BM25Index
-        from indexing.fts_index import FTSIndex
-        from indexing.qdrant_store import QdrantStore
-        from retrieval import (
-            ChunkStore,
-            ContextAssembler,
-            CrossEncoderReranker,
-            GraphExpander,
-            HybridRetriever,
-        )
+        from indexing.generation import GenerationManager
+        from retrieval.scope import Scope
+        from retrieval.service import RetrievalService
 
-        chunk_store = ChunkStore(str(Path(settings.data_dir) / "chunks.jsonl"))
-        qdrant = QdrantStore(path=settings.qdrant_path)
-        bm25 = BM25Index(index_dir=settings.bm25_index_dir)
-        fts = FTSIndex(db_path=settings.db_path)
-
-        retriever = HybridRetriever(qdrant=qdrant, bm25=bm25, fts=fts, chunk_store=chunk_store)
-        expander = GraphExpander(db_path=settings.db_path, chunk_store=chunk_store, hop_depth=1)
-        reranker = CrossEncoderReranker()
-        assembler = ContextAssembler(max_tokens=3000)
+        if not self.repo:
+            raise ValueError("evaluation requires repo=...; refusing unscoped retrieval")
+        active = GenerationManager(self.generation_root, self.repo).active()
+        if active is None:
+            raise ValueError(
+                f"no active generation for {self.repo!r}; run ingestion and phase 3 first"
+            )
+        scope = Scope.build(self.repo)
+        service = RetrievalService.from_generation(active, settings)
         generator = DirectQAGenerator()
 
         results: list[EvalResult] = []
@@ -266,10 +275,9 @@ class RagasEvaluator:
                 q = pair.get("question", "")
                 gt = pair.get("answer", "")
                 t0 = time.perf_counter()
-                candidates = retriever.retrieve(q, limit=40)
-                expanded = expander.expand(candidates)
-                reranked = reranker.rerank(q, expanded, top_k=12)
-                context = assembler.assemble(reranked)
+                outcome = service.retrieve(q, scope, top_k=12, limit=40)
+                reranked = outcome.candidates
+                context = outcome.assembled.text
                 gen = generator.generate(q, context)
                 meta["latencies"].append(time.perf_counter() - t0)
                 meta["timestamps"].append([str(c.metadata.get("timestamp", "")) for c in reranked])
@@ -287,10 +295,7 @@ class RagasEvaluator:
                 )
                 results.append(EvalResult(question=q, answer=gen.answer, ground_truth=gt, context=context))
         finally:
-            expander.close()
-            retriever.close()
-            qdrant.close()
-            fts.close()
+            service.close()
             generator.close()
         return results, meta
 

@@ -32,6 +32,8 @@ def run_configurations(
     split: str | None = "eval",
     ragas_config: RagasConfig | None = None,
     backend: Any = None,
+    repo: str | None = None,
+    generation_root: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run every configuration; each gets its own MLflow run.
 
@@ -41,7 +43,8 @@ def run_configurations(
     out: dict[str, dict[str, Any]] = {}
     for name, runner in configurations.items():
         evaluator = RagasEvaluator(
-            config=ragas_config, backend=backend, pipeline_runner=runner, logger=logger
+            config=ragas_config, backend=backend, pipeline_runner=runner, logger=logger,
+            repo=repo, generation_root=generation_root,
         )
         try:
             metrics = evaluator.evaluate(
@@ -71,6 +74,8 @@ def main() -> int:
     parser.add_argument("--experiment", default="gitmind")
     parser.add_argument("--tracking-uri", default=None)
     parser.add_argument("--configs", nargs="*", default=None, help="subset of configuration names")
+    parser.add_argument("--repo", required=True, help="repository whose active generation is evaluated")
+    parser.add_argument("--generation-root", default=None, help="defaults to <data_dir>/generations")
     args = parser.parse_args()
 
     names = args.configs or list(CONFIGURATIONS)
@@ -85,6 +90,8 @@ def main() -> int:
         logger,
         limit=args.limit,
         split=args.split or None,
+        repo=args.repo,
+        generation_root=args.generation_root,
     )
     print(json.dumps({"results": results, "mlflow": logger.status()}, indent=2, default=str))
     failed = any(r["error"] or r["mlflow_logged"] is False for r in results.values())

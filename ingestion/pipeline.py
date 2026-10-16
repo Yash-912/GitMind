@@ -234,7 +234,7 @@ def ingest_repository(
         commits = [SimpleNamespace(**c) for c in store.get_documents("commit", repo_id)]
         prs = [SimpleNamespace(**c) for c in store.get_documents("pr", repo_id)]
         issues = [SimpleNamespace(**c) for c in store.get_documents("issue", repo_id)]
-        linker = CrossReferenceLinker()
+        linker = CrossReferenceLinker(repo=repo_id)
         graphql_prs = [
             SimpleNamespace(
                 number=g["number"],
