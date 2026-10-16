@@ -121,6 +121,9 @@ class QdrantStore:
         self._code_enabled_cache: bool | None = dual_vectors
 
         from config.settings import settings as _s
+        # The remote client drops collection metadata (qdrant-client accepts it but never
+        # sends it), so remote stores keep the identity in a companion collection.
+        self._remote = bool(_s.qdrant_url)
         if _s.qdrant_url:
             # Remote service; the API key is optional (e.g. unauthenticated docker).
             self.client = QdrantClient(
@@ -161,16 +164,19 @@ class QdrantStore:
             vectors_config["code"] = VectorParams(size=self.code_dim, distance=Distance.COSINE)
         self._code_enabled_cache = bool(self.dual_vectors)
 
+        meta = {
+            "embedding": self.embedding or {},
+            "generation_id": self.generation_id,
+            "repo": self.repo,
+            "dual_vectors": bool(self.dual_vectors),
+        }
         self.client.create_collection(
             collection_name=self.collection_name,
             vectors_config=vectors_config,
-            metadata={
-                "embedding": self.embedding or {},
-                "generation_id": self.generation_id,
-                "repo": self.repo,
-                "dual_vectors": bool(self.dual_vectors),
-            },
+            metadata=meta,
         )
+        if self._remote:
+            self._write_companion_metadata(meta)
 
         # Create payload indexes for fast filtering (no-ops in local mode)
         for field in ("doc_type", "author", "graph_node_id", "repo", "scope",
@@ -190,8 +196,34 @@ class QdrantStore:
     # Collection metadata / identity
     # ------------------------------------------------------------------
 
+    @property
+    def _companion_name(self) -> str:
+        return f"{self.collection_name}__meta"
+
+    def _write_companion_metadata(self, meta: dict) -> None:
+        import uuid as _uuid
+        from qdrant_client.models import Distance, PointStruct, VectorParams
+
+        name = self._companion_name
+        if name not in [c.name for c in self.client.get_collections().collections]:
+            self.client.create_collection(
+                collection_name=name, vectors_config=VectorParams(size=1, distance=Distance.DOT)
+            )
+        self.client.upsert(
+            collection_name=name,
+            points=[PointStruct(id=str(_uuid.uuid5(_uuid.NAMESPACE_URL, "metadata")),
+                                vector=[0.0], payload={"metadata": meta})],
+            wait=True,
+        )
+
     def get_metadata(self) -> dict:
         """Metadata stored with the collection (embedding identity, generation...)."""
+        if self._remote:
+            name = self._companion_name
+            if name not in [c.name for c in self.client.get_collections().collections]:
+                return {}
+            points, _ = self.client.scroll(collection_name=name, limit=1, with_payload=True)
+            return dict((points[0].payload or {}).get("metadata") or {}) if points else {}
         info = self.client.get_collection(self.collection_name)
         return dict(getattr(info.config, "metadata", None) or {})
 
@@ -413,6 +445,10 @@ class QdrantStore:
         existed = name in [c.name for c in self.client.get_collections().collections]
         if existed:
             self.client.delete_collection(collection_name=name)
+        if self._remote and name == self.collection_name:
+            companion = f"{name}__meta"
+            if companion in [c.name for c in self.client.get_collections().collections]:
+                self.client.delete_collection(collection_name=companion)
         return existed
 
     def list_collections(self) -> list[str]:
