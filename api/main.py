@@ -26,7 +26,7 @@ from api.answering import (
     source_refs,
 )
 from api.jobs import JobRunner, JobStore, QueueFullError, default_steps
-from api.resources import RepoNotReady, ResourceRegistry, discover_repos
+from api.resources import RepoNotReady, ResourceRegistry, discover_repos, probe_qdrant
 from api.schemas import (
     HealthResponse,
     IngestRequest,
@@ -95,6 +95,16 @@ def create_app(
     jobs_db: str | Path | None = None,
     coverage_fn: Callable[[Any], bool] | None = None,
 ) -> FastAPI:
+    if Path(settings.generations_dir).resolve() != (
+        Path(settings.data_dir) / "generations"
+    ).resolve():
+        # Phase 2 always writes under DATA_DIR/generations; a different root
+        # would publish generations the API never reads.
+        raise ValueError(
+            "GENERATIONS_DIR must equal DATA_DIR/generations: scripts/run_phase2.py "
+            "writes there and the API reads from settings.generations_dir"
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         registry_kwargs = {"service_factory": service_factory} if service_factory else {}
@@ -174,17 +184,9 @@ def create_app(
             gen = entry.generation
             item.generation_id, item.commit = gen.generation_id, gen.commit
             item.chunk_count, item.embedding = gen.chunk_count, dict(gen.embedding)
-            health: dict = {}
-            probe = getattr(entry.service, "health", None)
-            if callable(probe):
-                try:
-                    health = probe() or {}
-                except Exception as exc:
-                    item.degraded.append(f"health_probe_failed: {type(exc).__name__}")
-            qdrant = health.get("qdrant_reachable", getattr(entry.service, "qdrant_reachable", None))
-            reranker = health.get("reranker_available", getattr(entry.service, "reranker_available", None))
-            item.qdrant_reachable = qdrant if isinstance(qdrant, bool) else None
-            item.reranker_available = reranker if isinstance(reranker, bool) else None
+            item.qdrant_reachable = probe_qdrant(entry.service)
+            item.reranker_available = bool(getattr(entry.service, "reranker_available", False))
+            item.degraded.extend(str(w) for w in getattr(entry.service, "startup_warnings", []))
             if item.chunk_count <= 0:
                 item.degraded.append("empty_corpus")
             if item.qdrant_reachable is False:

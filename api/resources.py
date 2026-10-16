@@ -63,6 +63,20 @@ def default_service_factory(generation: Generation) -> Any:
     return RetrievalService.from_generation(generation, settings)
 
 
+def probe_qdrant(service: Any) -> bool | None:
+    """True/False if the service's Qdrant handle answers a cheap call; None if the
+    service exposes no Qdrant handle to probe."""
+    retriever = getattr(service, "retriever", None)
+    qdrant = getattr(retriever, "qdrant", None)
+    if qdrant is None:
+        return None
+    try:
+        qdrant.count()
+        return True
+    except Exception:
+        return False
+
+
 def discover_repos(root: str | Path) -> list[str]:
     """Repo identities that have a published (ACTIVE) generation under `root`."""
     found: list[str] = []

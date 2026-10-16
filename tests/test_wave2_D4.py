@@ -36,6 +36,16 @@ def cand(cid: str, score: float = 0.5, **meta):
     return SimpleNamespace(chunk_id=cid, score=score, source="dense", text=f"text {cid}", metadata=base)
 
 
+class _FakeQdrant:
+    def __init__(self, service):
+        self.service, self.up = service, True
+
+    def count(self):
+        if not self.up:
+            raise ConnectionError("qdrant down")
+        return 3
+
+
 class FakeService:
     def __init__(self, gen, *, candidates=None, included=None, error=None, gate=None):
         self.gen = gen
@@ -45,8 +55,14 @@ class FakeService:
         self.gate = gate
         self.calls: list = []
         self.closed = False
-        self.qdrant_reachable = True
         self.reranker_available = True
+        self.startup_warnings: list[str] = []
+        # Mirrors the real service: Qdrant is reached through retriever.qdrant.
+        self.retriever = SimpleNamespace(qdrant=_FakeQdrant(self))
+
+    @property
+    def qdrant_reachable(self) -> bool:
+        return self.retriever.qdrant.up
 
     def retrieve(self, question, scope, top_k=12, limit=40):
         self.calls.append((question, scope, top_k, limit))
@@ -105,12 +121,13 @@ def publish(root, repo=REPO, chunks=3, *, commit="abc123"):
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "generations_dir", str(tmp_path / "gens"))
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "generations_dir", str(tmp_path / "data" / "generations"))
     monkeypatch.setattr(settings, "jobs_db_path", str(tmp_path / "jobs.db"))
     monkeypatch.setattr(settings, "allowed_repos", [])
     monkeypatch.setattr(settings, "api_key", None)
     monkeypatch.setattr(settings, "query_timeout_s", 50.0)
-    return SimpleNamespace(root=str(tmp_path / "gens"), tmp=tmp_path)
+    return SimpleNamespace(root=str(tmp_path / "data" / "generations"), tmp=tmp_path)
 
 
 @pytest.fixture
@@ -331,7 +348,7 @@ def test_ready_reports_generation_details(make_client):
 def test_ready_lists_degraded_components_explicitly(make_client):
     c = make_client()
     svc = c.services[0]
-    svc.qdrant_reachable, svc.reranker_available = False, False
+    svc.retriever.qdrant.up, svc.reranker_available = False, False
     r = c.get("/ready")
     assert r.status_code == 503
     repo = r.json()["repos"][0]
@@ -590,13 +607,67 @@ def test_default_steps_use_argument_lists_and_unbuffered_scripts():
     steps = default_steps(REPO, {"github_repo": REPO, "repo_path": ".", "max_commits": 5})
     labels = [s[0] for s in steps]
     assert labels == ["ingest", "parse and chunk", "embed and index"]
-    for _, argv in steps:
+    ingest, phase2 = steps[0][1], steps[1][1]
+    for argv in (ingest, phase2):
         assert isinstance(argv, list) and argv[:2] == [sys.executable, "-u"]
-    ingest = steps[0][1]
     assert "--github-repo" in ingest and "--repo-path" not in ingest   # "." placeholder dropped
     assert ingest[ingest.index("--max-commits") + 1] == "5"
-    assert steps[1][1][-2:] == ["--repo", REPO]
-    assert "--generation" in steps[2][1]
+    assert phase2[-2:] == ["--repo", REPO]
+    phase3 = steps[2][1]
+    assert callable(phase3)                       # needs phase 2's generation id
+    with pytest.raises(RuntimeError, match="GENERATION_ID"):
+        phase3({})
+    argv = phase3({"GENERATION_ID": "20240101T000000000000Z-abc123"})
+    assert argv[argv.index("--generation") + 1] == "20240101T000000000000Z-abc123"
+    assert argv[argv.index("--repo") + 1] == REPO
+
+
+def test_phase2_generation_id_is_passed_to_phase3(tmp_path):
+    store = JobStore(tmp_path / "j.db")
+    received = tmp_path / "phase3_args.txt"
+    steps = lambda r, p: [
+        py_step("print('working');print('GENERATION_ID=gen-42',flush=True)", "parse and chunk"),
+        (
+            "embed and index",
+            lambda captured: [PY, "-u", "-c",
+                              f"open(r'{received}','w').write('{captured.get('GENERATION_ID')}')"],
+        ),
+    ]
+    runner = JobRunner(store, steps=steps)
+    job = runner.submit(REPO, {})
+    final = wait_for(store, job["id"], {"succeeded", "failed"})
+    runner.shutdown()
+    assert final["status"] == "succeeded"
+    assert received.read_text() == "gen-42"
+    store.close()
+
+
+def test_missing_generation_id_fails_the_job_before_embedding(tmp_path):
+    store = JobStore(tmp_path / "j.db")
+    steps = lambda r, p: [
+        py_step("print('no id here')", "parse and chunk"),
+        ("embed and index", _phase3_argv_for_test()),
+    ]
+    runner = JobRunner(store, steps=steps)
+    job = runner.submit(REPO, {})
+    final = wait_for(store, job["id"], {"succeeded", "failed"})
+    runner.shutdown()
+    assert final["status"] == "failed" and "GENERATION_ID" in final["error"]
+    store.close()
+
+
+def _phase3_argv_for_test():
+    from api.jobs import _phase3_argv
+
+    return _phase3_argv(REPO)
+
+
+def test_generations_dir_must_match_phase2_location(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "generations_dir", str(tmp_path / "elsewhere"))
+    with pytest.raises(ValueError, match="DATA_DIR/generations"):
+        create_app(service_factory=lambda g: FakeService(g), llm_factory=lambda: FakeLLM(DIRECT_OK),
+                   jobs_db=tmp_path / "jobs.db")
 
 
 def test_ingest_endpoint_queues_polls_and_cancels(make_client):
