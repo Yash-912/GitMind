@@ -121,7 +121,8 @@ class RetrievalService:
         from .query_embedder import QueryEmbedder
         from .reranker import CrossEncoderReranker
 
-        identity = dict(gen.embedding) if gen.embedding else None
+        # gen.embedding is {"semantic": identity, "code": identity|None}; queries use the semantic space.
+        identity = (gen.embedding or {}).get("semantic") or None
         embedder = embedder or QueryEmbedder(expected_identity=identity)
         embedder.check_collection_identity(identity)  # fail fast, before opening stores
 
@@ -129,16 +130,20 @@ class RetrievalService:
         closers: list[Callable[[], None]] = []
         try:
             chunk_store = ChunkStore(str(gen.chunks_path))
-            bm25 = bm25 or BM25Index(index_dir=str(gen.bm25_dir))
+            bm25 = bm25 or BM25Index(str(gen.bm25_dir))
             if fts is None:
-                fts = FTSIndex(db_path=str(gen.fts_path))
+                fts = FTSIndex(str(gen.fts_path), read_only=True)
                 closers.append(fts.close)
             if qdrant is None:
                 qdrant_kwargs: dict[str, Any] = {}
                 if identity and identity.get("dim"):
                     qdrant_kwargs["semantic_dim"] = int(identity["dim"])
+                # embedding= makes the store verify the collection's recorded identity on open.
                 qdrant = QdrantStore(
-                    path=settings.qdrant_path, collection_name=gen.qdrant_collection, **qdrant_kwargs
+                    path=settings.qdrant_path,
+                    collection=gen.qdrant_collection,
+                    embedding=gen.embedding,
+                    **qdrant_kwargs,
                 )
                 closers.append(qdrant.close)
             retriever = HybridRetriever(
@@ -228,7 +233,6 @@ class RetrievalService:
                 )
         if not candidates:
             candidates = run(scope)
-        warnings.extend(getattr(self.retriever, "branch_notes", []) or [])
 
         graph_paths: list[list[PathHop]] = []
         if self.graph_walker is not None and route.expand_graph and candidates:
