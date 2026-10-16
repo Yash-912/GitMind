@@ -6,6 +6,7 @@ import re
 
 from pydantic import BaseModel
 
+from generation.answers import extract_json_object
 from generation.llm_client import LLMClient
 from .types import QueryPlan
 
@@ -120,7 +121,10 @@ class QueryDecomposer:
         )
         try:
             resp = self.llm.generate(prompt).text
-            data = json.loads(resp)
+            # Models often wrap JSON in a ```json fence; extract the object either way.
+            data = extract_json_object(resp)
+            if data is None:
+                raise ValueError("LLM reply contained no JSON object")
             plan = _PlanSchema.model_validate(data)
         except Exception as exc:  # noqa: BLE001 - surfaced via plan.warnings
             log.warning("query decomposition LLM failed: %s", exc)

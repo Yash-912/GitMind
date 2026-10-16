@@ -5,6 +5,11 @@ import json
 from pathlib import Path
 import sys
 
+# Console output may be cp1252 when redirected on Windows; never let a print crash a run.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import settings

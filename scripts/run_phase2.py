@@ -22,6 +22,11 @@ import json
 import os
 import argparse
 import sys
+
+# Console output may be cp1252 when redirected on Windows; never let a print crash a run.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 import time
 from pathlib import Path
 from types import SimpleNamespace
