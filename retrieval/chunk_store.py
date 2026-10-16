@@ -39,3 +39,10 @@ class ChunkStore:
 
     def by_node(self, node_id: str) -> list[str]:
         return self._by_node.get(node_id, [])
+
+    def records(self) -> list[dict[str, Any]]:
+        """All chunk records (used to compute scope-allowed id sets)."""
+        return list(self._by_id.values())
+
+    def __len__(self) -> int:
+        return len(self._by_id)

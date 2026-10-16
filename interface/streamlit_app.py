@@ -1,170 +1,211 @@
 """interface/streamlit_app.py — GitMind dashboard.
 
-In production (HF Spaces) this app is a thin REST client that calls the
-FastAPI backend running in the same container on port 8000.
-Set the env var GITMIND_API_URL to point to a different backend.
+A thin REST client for the FastAPI backend (GITMIND_API_URL, default
+http://localhost:8000). All logic that can be tested without Streamlit lives
+in interface/api_client.py.
 """
 from __future__ import annotations
 
 import os
+import sys
 import time
+from pathlib import Path
 
-import httpx
 import streamlit as st
 
-# ------------------------------------------------------------------ #
-# Config                                                               #
-# ------------------------------------------------------------------ #
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# When running inside HF Spaces the FastAPI server starts on port 8000
-# and Streamlit on port 7860.  GITMIND_API_URL defaults to localhost.
+from interface.api_client import ApiError, GitMindClient, build_query_payload  # noqa: E402
+
 API_URL = os.getenv("GITMIND_API_URL", "http://localhost:8000")
-API_KEY = os.getenv("API_KEY", "")  # optional — matches the FastAPI secret
-
-_HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
-
-# ------------------------------------------------------------------ #
-# Helpers                                                              #
-# ------------------------------------------------------------------ #
+API_KEY = os.getenv("API_KEY", "")  # optional: matches the FastAPI secret
+ACTIVE_JOB_STATES = {"queued", "running"}
 
 
-def _post(path: str, payload: dict) -> dict:
-    with httpx.Client(base_url=API_URL, timeout=180.0) as client:
-        resp = client.post(path, json=payload, headers=_HEADERS)
-        resp.raise_for_status()
-        return resp.json()
+@st.cache_resource
+def _client() -> GitMindClient:
+    return GitMindClient(API_URL, API_KEY)
 
 
-def _get(path: str) -> dict:
-    with httpx.Client(base_url=API_URL, timeout=30.0) as client:
-        resp = client.get(path, headers=_HEADERS)
-        resp.raise_for_status()
-        return resp.json()
+def _source_rows(items: list[dict]) -> list[dict]:
+    return [
+        {
+            "chunk": s["chunk_id"][:12],
+            "doc_type": s["doc_type"],
+            "doc_id": s["doc_id"],
+            "author": s["author"],
+            "timestamp": (s["timestamp"] or "")[:19],
+            "commit": s["commit_sha"][:10],
+            "path": s["path"],
+            "lines": f"{s['line_start']}-{s['line_end']}" if s.get("line_start") else "",
+            "url": s["source_url"],
+            "score": s["score"],
+            "snippet": s["snippet"],
+        }
+        for s in items
+    ]
 
 
-# ------------------------------------------------------------------ #
-# Page layout                                                          #
-# ------------------------------------------------------------------ #
+st.set_page_config(page_title="GitMind — Codebase Archaeology", page_icon="🧠", layout="wide")
 
-st.set_page_config(
-    page_title="GitMind — Codebase Archaeology",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ---- Sidebar ----
+# ---------------------------------------------------------------- sidebar --
 with st.sidebar:
-    st.image(
-        "https://huggingface.co/front/assets/huggingface_logo-noborder.svg",
-        width=40,
-    )
     st.title("GitMind")
     st.caption("Ask **why** questions about your codebase history.")
-
     st.divider()
 
-    # Health check
-    with st.expander("🔌 Backend status", expanded=False):
+    ready_repos: list[str] = []
+    with st.expander("🔌 Backend readiness", expanded=False):
         if st.button("Check"):
             try:
-                data = _get("/health")
-                if data.get("status") == "ok":
-                    st.success("API is healthy ✅")
-                else:
-                    st.warning("API degraded ⚠️")
-                st.json(data)
-            except Exception as exc:
-                st.error(f"Cannot reach API: {exc}")
+                report = _client().ready()
+                (st.success if report["status"] == "ready" else st.warning)(
+                    f"API status: {report['status']}"
+                )
+                for item in report["repos"]:
+                    st.write(f"**{item['repo']}** — {'ready' if item['ready'] else 'NOT ready'}")
+                    st.json(item)
+                if report["degraded"]:
+                    st.warning("Degraded: " + "; ".join(report["degraded"]))
+            except ApiError as exc:
+                st.error(f"Cannot read readiness: {exc.message}")
+    try:
+        ready_repos = [r["repo"] for r in _client().ready()["repos"] if r["ready"]]
+    except ApiError:
+        pass
 
     st.divider()
-
-    # Ingestion
-    st.subheader("📥 Ingest Repository")
+    st.subheader("📥 Ingest repository")
     repo_path = st.text_input("Local repo path", value=".")
     github_repo = st.text_input("GitHub repo (owner/name)", value="")
     max_commits = st.number_input("Max commits (0 = all)", value=0, min_value=0)
+    if st.button("Start ingestion"):
+        try:
+            resp = _client().start_ingest(repo_path, github_repo, int(max_commits))
+            st.session_state["job_id"] = resp["job_id"]
+            st.session_state["job_repo"] = resp.get("repo")
+            st.success(f"Queued job `{resp['job_id'][:8]}` for {resp.get('repo')}")
+        except ApiError as exc:
+            st.error(f"Ingestion not started ({exc.status_code}): {exc.message}")
 
-    if st.button("Start Ingestion"):
-        with st.spinner("Triggering ingestion…"):
-            try:
-                payload: dict = {"repo_path": repo_path}
-                if github_repo:
-                    payload["github_repo"] = github_repo
-                if max_commits:
-                    payload["max_commits"] = max_commits
-                resp = _post("/api/v1/ingest", payload)
-                st.success(f"Ingestion started — task `{resp.get('task_id', '?')}`")
-            except Exception as exc:
-                st.error(f"Ingestion failed: {exc}")
+    @st.fragment(run_every="2s")
+    def job_panel() -> None:
+        job_id = st.session_state.get("job_id")
+        if not job_id:
+            return
+        try:
+            job = _client().job(job_id)
+        except ApiError as exc:
+            st.error(f"Cannot read job: {exc.message}")
+            return
+        st.markdown(f"**Job** `{job['id'][:8]}` · {job['repo']} · **{job['status']}**")
+        if job["progress"]:
+            st.caption(job["progress"])
+        if job["status"] in ACTIVE_JOB_STATES:
+            st.progress(0.5 if job["status"] == "running" else 0.0)
+            if st.button("Cancel job", key="cancel_job"):
+                try:
+                    _client().cancel(job_id)
+                except ApiError as exc:
+                    st.error(exc.message)
+        elif job["status"] == "succeeded":
+            st.success("Done — the new index generation is live.")
+        else:
+            st.error(f"{job['status']}: {job['error'] or 'no details'}")
 
-# ---- Main area ----
+    job_panel()
+
+    with st.expander("Recent jobs"):
+        try:
+            st.dataframe(
+                [
+                    {k: j[k] for k in ("id", "repo", "status", "progress", "started_at", "error")}
+                    for j in _client().jobs()[:10]
+                ],
+                use_container_width=True,
+            )
+        except ApiError as exc:
+            st.caption(f"unavailable: {exc.message}")
+
+# ------------------------------------------------------------------- main --
 st.title("🧠 GitMind — Codebase Archaeology")
 st.write(
-    "Ask natural language questions about **why** your codebase is the way it is. "
-    "GitMind reconstructs institutional knowledge from git history, PRs, and issues."
+    "Ask natural-language questions about **why** a codebase is the way it is. Every answer is "
+    "scoped to one repository and reports which evidence was retrieved, shown to the model, and cited."
 )
 
-query = st.text_area(
-    "Your question",
-    placeholder="e.g. Why does the auth module use JWT instead of session cookies?",
-    height=80,
-)
+default_repo = st.session_state.get("job_repo") or (ready_repos[0] if ready_repos else "")
+if ready_repos:
+    options = ready_repos + ["(enter another)"]
+    choice = st.selectbox("Repository", options, index=options.index(default_repo) if default_repo in options else 0)
+    repo = st.text_input("Repository (owner/name)", value=default_repo) if choice == "(enter another)" else choice
+else:
+    st.warning("No repository has a ready index yet. Ingest one from the sidebar.")
+    repo = st.text_input("Repository (owner/name)", value=default_repo)
 
-col1, col2, col3 = st.columns([2, 2, 2])
-with col1:
+query = st.text_area("Your question", placeholder="Why does the auth module use JWT instead of sessions?", height=80)
+
+c1, c2, c3 = st.columns(3)
+with c1:
     mode = st.selectbox(
-        "Answer mode",
-        options=["direct", "memo", "blame", "risk"],
-        format_func=lambda x: {
-            "direct": "📝 Direct Q&A",
-            "memo": "📋 Decision Memo",
-            "blame": "👤 Blame Map",
-            "risk": "⚠️ Risk Report",
-        }[x],
+        "Answer mode", ["direct", "memo", "blame", "risk"],
+        format_func=lambda x: {"direct": "📝 Direct Q&A", "memo": "📋 Decision Memo",
+                               "blame": "👤 Blame Map", "risk": "⚠️ Risk Report"}[x],
     )
-with col2:
-    top_k = st.slider("Evidence chunks (top-k)", min_value=3, max_value=20, value=12)
-with col3:
-    limit = st.slider("Retrieval candidates", min_value=10, max_value=100, value=40)
+with c2:
+    top_k = st.slider("Evidence chunks (top-k)", 3, 20, 12)
+with c3:
+    limit = st.slider("Retrieval candidates", 10, 100, 40)
 
-run = st.button("🔍 Answer", type="primary", disabled=not query.strip())
+with st.expander("Filters (optional)"):
+    f1, f2 = st.columns(2)
+    authors = f1.text_input("Authors (comma-separated)")
+    modules = f2.text_input("Modules (comma-separated)")
+    doc_types = f1.text_input("Document types (e.g. commit, pr, issue)")
+    kind = f2.selectbox("Corpus", ["any", "history", "snapshot"])
+    time_start = f1.text_input("From (ISO date, e.g. 2023-01-01)")
+    time_end = f2.text_input("To (ISO date)")
 
-if run and query.strip():
+if st.button("🔍 Answer", type="primary", disabled=not (query.strip() and repo.strip())):
+    payload = build_query_payload(
+        repo, query, mode, top_k=top_k, limit=limit, authors=authors, doc_types=doc_types,
+        modules=modules, kind=kind, time_start=time_start or None, time_end=time_end or None,
+    )
     with st.spinner("Retrieving and generating answer…"):
         t0 = time.time()
         try:
-            data = _post(
-                "/api/v1/query",
-                {"query": query, "mode": mode, "top_k": top_k, "limit": limit},
-            )
-            elapsed = time.time() - t0
-
-            st.success(f"Done in {elapsed:.1f}s  •  Model: `{data.get('model', '?')}`")
-
-            # Answer
+            data = _client().query(payload)
+        except ApiError as exc:
+            if exc.kind == "provider_unavailable":
+                st.error(f"The language model is unavailable: {exc.message}")
+            elif exc.kind == "invalid_output":
+                st.error(f"The model's answer failed validation and was withheld: {exc.message}")
+            elif exc.kind in ("embedding_unavailable", "index_not_ready", "index_unavailable"):
+                st.error(f"Search is unavailable ({exc.kind}): {exc.message}")
+            else:
+                st.error(f"API error {exc.status_code}: {exc.message}")
+            data = None
+    if data:
+        elapsed = time.time() - t0
+        if data["status"] == "insufficient_evidence":
+            st.warning(data["answer"])
+        else:
+            st.success(f"Answered in {elapsed:.1f}s · model `{data.get('model') or '?'}` · generation `{data['generation_id'][:8]}`")
             st.subheader("Answer")
-            st.write(data.get("answer", ""))
-
-            # Evidence table
-            evidence = data.get("evidence", [])
-            if evidence:
-                st.subheader(f"Evidence ({len(evidence)} chunks)")
-                rows = [
-                    {
-                        "score": f"{e['score']:.4f}",
-                        "source": e["source"],
-                        "doc_type": e["doc_type"],
-                        "doc_id": e["doc_id"],
-                        "author": e["author"],
-                        "timestamp": e["timestamp"][:10] if e["timestamp"] else "",
-                        "snippet": e["snippet"],
-                    }
-                    for e in evidence
-                ]
-                st.dataframe(rows, use_container_width=True)
-
-        except httpx.HTTPStatusError as exc:
-            st.error(f"API error {exc.response.status_code}: {exc.response.text}")
-        except Exception as exc:
-            st.error(f"Request failed: {exc}")
+            st.write(data["answer"])
+        for w in data.get("warnings", []):
+            st.caption(f"⚠️ {w}")
+        if data.get("statistics"):
+            with st.expander("Computed statistics"):
+                st.json(data["statistics"])
+        tabs = st.tabs([
+            f"Cited ({len(data['cited'])})",
+            f"Shown to model ({len(data['included'])})",
+            f"Retrieved ({len(data['retrieved'])})",
+        ])
+        for tab, key in zip(tabs, ("cited", "included", "retrieved")):
+            with tab:
+                if data[key]:
+                    st.dataframe(_source_rows(data[key]), use_container_width=True)
+                else:
+                    st.caption("none")

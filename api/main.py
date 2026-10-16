@@ -1,297 +1,350 @@
-"""api/main.py — FastAPI application for GitMind production deployment."""
+"""api/main.py — FastAPI application for GitMind production deployment.
+
+Resources (per-repository active generation + retrieval service, shared LLM
+client, job store) are created once in the lifespan. Endpoints are plain
+``def`` so FastAPI runs them in its threadpool, keeping the event loop free.
+"""
 from __future__ import annotations
 
-import uuid
+import hmac
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException, Security, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 
-from config.settings import settings
+from api.answering import (
+    DeadlineLLM,
+    build_scope,
+    coverage_complete,
+    generate_structured_answer,
+    source_ref,
+    source_refs,
+)
+from api.jobs import JobRunner, JobStore, QueueFullError, default_steps
+from api.resources import RepoNotReady, ResourceRegistry, discover_repos
 from api.schemas import (
-    QueryRequest,
-    QueryResponse,
-    EvidenceItem,
+    HealthResponse,
     IngestRequest,
     IngestResponse,
-    HealthResponse,
+    JobResponse,
+    Mode,
+    QueryRequest,
+    QueryResponse,
+    ReadyResponse,
+    RepoReadiness,
 )
+from config.settings import settings
+from embedding.models import EmbeddingError
+from generation.answers import AnswerStatus
+from retrieval.scope import ScopeError
 
-# ------------------------------------------------------------------ #
-# Shared state — loaded once at startup                                #
-# ------------------------------------------------------------------ #
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-_state: dict[str, Any] = {}
-_tasks: dict[str, str] = {}          # task_id → status string
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load heavy resources once when the server starts."""
-    from indexing.qdrant_store import QdrantStore
-    from indexing.bm25_index import BM25Index
-    from indexing.fts_index import FTSIndex
-    from retrieval import ChunkStore
-
-    chunks_path = str(Path(settings.data_dir) / "chunks.jsonl")
-
-    _state["chunk_store"] = ChunkStore(chunks_path)
-    _state["qdrant"] = QdrantStore(path=settings.qdrant_path)
-    _state["bm25"] = BM25Index(index_dir=settings.bm25_index_dir)
-    _state["fts"] = FTSIndex(db_path=settings.db_path)
-    _state["chunks_path"] = chunks_path
-
-    yield
-
-    # Cleanup on shutdown
-    _state.get("qdrant", None) and _state["qdrant"].close()
-    _state.get("fts", None) and _state["fts"].close()
+_HTTP_FOR_STATUS = {
+    AnswerStatus.ANSWERED: 200,
+    AnswerStatus.INSUFFICIENT_EVIDENCE: 200,
+    AnswerStatus.PROVIDER_UNAVAILABLE: 503,
+    AnswerStatus.INVALID_OUTPUT: 502,
+}
 
 
 # ------------------------------------------------------------------ #
-# App initialisation                                                   #
+# Helpers                                                              #
 # ------------------------------------------------------------------ #
 
-app = FastAPI(
-    title="GitMind API",
-    description="Codebase archaeology tool — query institutional knowledge from git history.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+def _error(code: int, kind: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=code, content={"status": kind, "error": message})
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ------------------------------------------------------------------ #
-# Authentication                                                       #
+# Application factory                                                  #
 # ------------------------------------------------------------------ #
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def _verify_key(api_key: str | None = Security(_api_key_header)) -> None:
-    """If API_KEY is configured, enforce it on every request."""
+    """If API_KEY is configured, enforce it. This gates access to the whole API;
+    it is not per-user authorization."""
     if not settings.api_key:
         return  # open access (dev / demo mode)
-    if api_key != settings.api_key:
+    if not api_key or not hmac.compare_digest(api_key, settings.api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key header.",
         )
 
 
-# ------------------------------------------------------------------ #
-# Routes                                                               #
-# ------------------------------------------------------------------ #
-
-@app.get("/health", response_model=HealthResponse, tags=["operations"])
-def health():
-    """Returns service health and basic storage statistics."""
-    qdrant_ok = False
-    qdrant_count = 0
-    try:
-        qdrant_count = _state["qdrant"].count()
-        qdrant_ok = True
-    except Exception:
-        pass
-
-    bm25_chunks = _state["bm25"].size if "bm25" in _state else 0
-
-    return HealthResponse(
-        status="ok" if qdrant_ok else "degraded",
-        qdrant_connected=qdrant_ok,
-        bm25_chunks=bm25_chunks,
-        details={"qdrant_vectors": qdrant_count},
-    )
+def _check_repo_allowed(repo: str) -> JSONResponse | None:
+    allowed = settings.allowed_repos
+    if allowed and repo not in allowed:
+        return _error(403, "repo_not_allowed", f"repository {repo!r} is not in the allowed set")
+    return None
 
 
-@app.post("/api/v1/query", response_model=QueryResponse, tags=["retrieval"])
-def query(req: QueryRequest, _: None = Security(_verify_key)):
-    """Full pipeline: query decomposition → hybrid retrieval → graph expansion
-    → reranking → LLM generation.
-    """
-    from retrieval import (
-        ChunkStore,
-        HybridRetriever,
-        GraphExpander,
-        CrossEncoderReranker,
-        ContextAssembler,
-        QueryDecomposer,
-        EntityResolver,
-    )
-    from generation import (
-        DirectQAGenerator,
-        DecisionMemoGenerator,
-        BlameMapGenerator,
-        RiskReportGenerator,
-    )
+def create_app(
+    *,
+    service_factory: Callable[[Any], Any] | None = None,
+    llm_factory: Callable[[], Any] | None = None,
+    steps: Callable[[str, dict], Any] | None = None,
+    jobs_db: str | Path | None = None,
+    coverage_fn: Callable[[Any], bool] | None = None,
+) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        registry_kwargs = {"service_factory": service_factory} if service_factory else {}
+        registry = ResourceRegistry(settings.generations_dir, **registry_kwargs)
+        if llm_factory is not None:
+            llm = llm_factory()
+        else:
+            from generation.llm_client import LLMClient
 
-    chunk_store = _state["chunk_store"]
-    qdrant = _state["qdrant"]
-    bm25 = _state["bm25"]
-    fts = _state["fts"]
-
-    # Reload ChunkStore in case ingestion ran after server startup.
-    fresh_chunk_store = ChunkStore(_state["chunks_path"])
-
-    # --- Query decomposition & entity resolution ---
-    decomposer = QueryDecomposer()
-    plan = decomposer.decompose(req.query)
-    decomposer.close()
-
-    resolver = EntityResolver(settings.db_path)
-    module_tags = resolver.resolve(plan.entities)
-    resolver.close()
-
-    # --- Retrieval ---
-    retriever = HybridRetriever(qdrant=qdrant, bm25=bm25, fts=fts, chunk_store=fresh_chunk_store)
-    candidates = retriever.retrieve(
-        req.query,
-        limit=req.limit,
-        filters={
-            "time_start": plan.time_start,
-            "time_end": plan.time_end,
-            "module_tags": module_tags,
-        },
-    )
-
-    expander = GraphExpander(db_path=settings.db_path, chunk_store=fresh_chunk_store, hop_depth=1)
-    expanded = expander.expand(candidates)
-    expander.close()
-
-    reranker = CrossEncoderReranker()
-    reranked = reranker.rerank(req.query, expanded, top_k=req.top_k)
-
-    assembler = ContextAssembler(max_tokens=3000)
-    context = assembler.assemble(reranked)
-
-    # --- Generation ---
-    mode = req.mode
-    if mode == "direct":
-        gen = DirectQAGenerator()
-        result = gen.generate(req.query, context)
-        answer = result.answer
-        model = result.model
-    elif mode == "memo":
-        gen = DecisionMemoGenerator(strict_json=False)
-        result = gen.generate(req.query, context)
-        answer = result.raw_text
-        model = result.model
-    elif mode == "blame":
-        gen = BlameMapGenerator()
-        result = gen.generate(req.query, context)
-        answer = result.raw_text
-        model = result.model
-    elif mode == "risk":
-        gen = RiskReportGenerator()
-        result = gen.generate(req.query, context)
-        answer = result.raw_text
-        model = result.model
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
-
-    gen.close()
-
-    # --- Build evidence list ---
-    evidence = [
-        EvidenceItem(
-            chunk_id=c.chunk_id,
-            score=round(c.score, 4),
-            source=c.source,
-            doc_type=c.metadata.get("doc_type", ""),
-            doc_id=c.metadata.get("doc_id", ""),
-            author=c.metadata.get("author", ""),
-            timestamp=c.metadata.get("timestamp", ""),
-            snippet=c.text[:200],
+            llm = LLMClient()
+        store = JobStore(jobs_db or settings.jobs_db_path)
+        store.mark_interrupted()
+        runner = JobRunner(
+            store,
+            steps=steps or default_steps,
+            queue_size=settings.job_queue_size,
+            timeout_s=settings.job_timeout_s,
+            on_success=registry.refresh,
         )
-        for c in reranked
-    ]
-
-    retriever.close()
-
-    return QueryResponse(
-        query=req.query,
-        mode=mode,
-        answer=answer,
-        model=model,
-        evidence=evidence,
-    )
-
-
-@app.post("/api/v1/ingest", response_model=IngestResponse, tags=["operations"])
-def ingest(req: IngestRequest, background_tasks: BackgroundTasks, _: None = Security(_verify_key)):
-    """Trigger repository ingestion as a background task."""
-    task_id = str(uuid.uuid4())
-    _tasks[task_id] = "started"
-
-    def _run_ingest():
-        import subprocess, sys
-        from pathlib import Path as _Path
-        _tasks[task_id] = "running"
-
-        # Resolve project root from this file's location so the CWD is
-        # always correct regardless of Docker entrypoint directory.
-        project_root = str(_Path(__file__).resolve().parent.parent)
-
-        cmd_p1 = [sys.executable, "-u", "scripts/ingest.py"]
-        # The UI's default '.' is a placeholder when a GitHub repository is supplied.
-        if not req.github_repo or req.repo_path != ".":
-            cmd_p1 += ["--repo-path", req.repo_path]
-        if req.github_repo:
-            cmd_p1 += ["--github-repo", req.github_repo]
-        if req.max_commits:
-            cmd_p1 += ["--max-commits", str(req.max_commits)]
-
+        app.state.registry, app.state.llm = registry, llm
+        app.state.jobs, app.state.runner = store, runner
+        app.state.coverage_fn = coverage_fn or coverage_complete
         try:
-            # Phase 1: Data ingestion
-            print(f"==> Starting Phase 1 ingestion for {req.github_repo or req.repo_path}...")
-            subprocess.run(cmd_p1, check=True, cwd=project_root)
+            repos = list(settings.allowed_repos) or discover_repos(settings.generations_dir)
+            app.state.load_failures = registry.load_all(repos)
+            yield
+        finally:
+            try:
+                runner.shutdown()
+            finally:
+                try:
+                    registry.close()
+                finally:
+                    try:
+                        llm.close()
+                    finally:
+                        store.close()
 
-            # Phase 2: Parsing & chunking
-            print("==> Starting Phase 2 parsing and chunking...")
-            from ingestion.repository import normalize_github_repo, repository_identity
-            if req.github_repo:
-                repo_id = normalize_github_repo(req.github_repo)
-            else:
-                from git import Repo
-                local_path = _Path(req.repo_path)
-                if not local_path.is_absolute():
-                    local_path = _Path(project_root) / local_path
-                with Repo(local_path) as local_repo:
-                    repo_id = repository_identity(local_repo)
-            subprocess.run([sys.executable, "-u", "scripts/run_phase2.py", "--repo", repo_id], check=True, cwd=project_root)
-
-            # Phase 3: Embedding & indexing
-            print("==> Starting Phase 3 embedding and indexing...")
-            subprocess.run([sys.executable, "-u", "scripts/run_phase3.py"], check=True, cwd=project_root)
-
-            _tasks[task_id] = "done"
-        except subprocess.CalledProcessError as exc:
-            _tasks[task_id] = f"error in command: {exc}"
-        except Exception as exc:
-            _tasks[task_id] = f"unexpected error: {exc}"
-
-    background_tasks.add_task(_run_ingest)
-
-    return IngestResponse(
-        status="started",
-        message="Ingestion started in the background.",
-        task_id=task_id,
+    app = FastAPI(
+        title="GitMind API",
+        description="Codebase archaeology tool — query institutional knowledge from git history.",
+        version="1.1.0",
+        lifespan=lifespan,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
+    # ---- liveness / readiness --------------------------------------- #
 
-@app.get("/api/v1/status/{task_id}", tags=["operations"])
-def task_status(task_id: str, _: None = Security(_verify_key)):
-    """Poll the status of a background ingestion task."""
-    status_str = _tasks.get(task_id)
-    if status_str is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return {"task_id": task_id, "status": status_str}
+    @app.get("/health", response_model=HealthResponse, tags=["operations"])
+    def health() -> HealthResponse:
+        """Liveness only: the process is up. Use /ready for corpus readiness."""
+        return HealthResponse()
+
+    @app.get("/ready", response_model=ReadyResponse, tags=["operations"])
+    def ready(request: Request, _: None = Security(_verify_key)):
+        registry: ResourceRegistry = request.app.state.registry
+        llm = request.app.state.llm
+        repos = list(settings.allowed_repos) or sorted(
+            set(registry.loaded_repos()) | set(discover_repos(settings.generations_dir))
+        )
+        report: list[RepoReadiness] = []
+        providers = list(getattr(llm, "providers", []))
+        for repo in repos:
+            item = RepoReadiness(repo=repo, ready=False, generation_providers=providers)
+            entry = registry.current(repo)
+            if entry is None:
+                err = registry.errors.get(repo) or request.app.state.load_failures.get(repo)
+                item.degraded.append(f"load_failed: {err}" if err else "no_active_generation")
+                report.append(item)
+                continue
+            gen = entry.generation
+            item.generation_id, item.commit = gen.generation_id, gen.commit
+            item.chunk_count, item.embedding = gen.chunk_count, dict(gen.embedding)
+            health: dict = {}
+            probe = getattr(entry.service, "health", None)
+            if callable(probe):
+                try:
+                    health = probe() or {}
+                except Exception as exc:
+                    item.degraded.append(f"health_probe_failed: {type(exc).__name__}")
+            qdrant = health.get("qdrant_reachable", getattr(entry.service, "qdrant_reachable", None))
+            reranker = health.get("reranker_available", getattr(entry.service, "reranker_available", None))
+            item.qdrant_reachable = qdrant if isinstance(qdrant, bool) else None
+            item.reranker_available = reranker if isinstance(reranker, bool) else None
+            if item.chunk_count <= 0:
+                item.degraded.append("empty_corpus")
+            if item.qdrant_reachable is False:
+                item.degraded.append("qdrant_unreachable")
+            elif item.qdrant_reachable is None:
+                item.degraded.append("qdrant_status_unknown")
+            if item.reranker_available is False:
+                item.degraded.append("reranker_unavailable")
+            if "gemini" not in providers:
+                item.degraded.append("gemini_not_configured")
+            item.ready = item.chunk_count > 0 and item.qdrant_reachable is not False
+            report.append(item)
+        overall = bool(report) and any(r.ready for r in report)
+        body = ReadyResponse(
+            status="ready" if overall else "not_ready",
+            repos=report,
+            degraded=[f"{r.repo}: {d}" for r in report for d in r.degraded],
+        )
+        return JSONResponse(
+            status_code=200 if overall else 503, content=body.model_dump(mode="json")
+        )
+
+    # ---- query ------------------------------------------------------- #
+
+    @app.post("/api/v1/query", response_model=QueryResponse, tags=["retrieval"])
+    def query(req: QueryRequest, request: Request, _: None = Security(_verify_key)):
+        """Scoped retrieval + validated generation. Outcomes are explicit:
+        answered / insufficient_evidence (200), invalid_output (502),
+        provider_unavailable or embedding outage (503)."""
+        denied = _check_repo_allowed(req.repo)
+        if denied is not None:
+            return denied
+        try:
+            scope = build_scope(req)
+        except ScopeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        deadline_at = time.monotonic() + settings.query_timeout_s
+        registry: ResourceRegistry = request.app.state.registry
+        llm = DeadlineLLM(request.app.state.llm, deadline_at)
+        try:
+            lease = registry.lease(req.repo)
+            entry = lease.__enter__()
+        except RepoNotReady as exc:
+            return _error(503, "index_not_ready", str(exc))
+        except Exception as exc:
+            return _error(503, "index_unavailable", f"{type(exc).__name__}: {exc}")
+        try:
+            try:
+                outcome = entry.service.retrieve(
+                    req.query, scope, top_k=req.top_k, limit=req.limit
+                )
+            except EmbeddingError as exc:
+                return _error(503, "embedding_unavailable", f"{type(exc).__name__}: {exc}")
+            if time.monotonic() > deadline_at:
+                return _error(504, "deadline_exceeded", "query exceeded its time budget during retrieval")
+
+            result = generate_structured_answer(
+                req.mode, req.query, scope, outcome, entry, llm, request.app.state.coverage_fn
+            )
+            candidates = list(outcome.candidates)
+            payload = QueryResponse(
+                status=result.status,
+                query=req.query,
+                repo=req.repo,
+                mode=req.mode,
+                generation_id=entry.generation_id,
+                answer=result.text,
+                data=result.data,
+                model=result.model,
+                provider=result.provider,
+                error=result.error,
+                retrieved=[source_ref(c) for c in candidates],
+                included=source_refs(candidates, result.included_ids),
+                cited=source_refs(candidates, result.cited_ids),
+                warnings=list(getattr(outcome, "warnings", []) or []),
+                reranker_available=getattr(outcome, "reranker_available", None),
+                statistics=(result.data or {}).get("statistics")
+                if req.mode in (Mode.BLAME, Mode.RISK) else None,
+            )
+            return JSONResponse(
+                status_code=_HTTP_FOR_STATUS[result.status],
+                content=payload.model_dump(mode="json"),
+            )
+        finally:
+            lease.__exit__(None, None, None)
+
+    # ---- ingestion jobs --------------------------------------------- #
+
+    def _resolve_repo(req: IngestRequest) -> str:
+        from ingestion.repository import normalize_github_repo, repository_identity
+
+        if req.github_repo:
+            return normalize_github_repo(req.github_repo)
+        from git import Repo
+
+        path = Path(req.repo_path)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        with Repo(path) as local:
+            return repository_identity(local)
+
+    def _job(row: dict) -> JobResponse:
+        return JobResponse(
+            **{k: row[k] for k in (
+                "id", "repo", "status", "progress", "created_at",
+                "started_at", "finished_at", "error",
+            )}
+        )
+
+    @app.post("/api/v1/ingest", response_model=IngestResponse, status_code=202, tags=["operations"])
+    def ingest(req: IngestRequest, request: Request, _: None = Security(_verify_key)):
+        """Queue a durable ingestion job (ingest -> parse/chunk -> index generation)."""
+        try:
+            repo = _resolve_repo(req)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"cannot resolve repository: {exc}")
+        denied = _check_repo_allowed(repo)
+        if denied is not None:
+            return denied
+        try:
+            job = request.app.state.runner.submit(repo, req.model_dump())
+        except QueueFullError as exc:
+            raise HTTPException(status_code=429, detail=str(exc))
+        return IngestResponse(
+            status="queued",
+            message="Ingestion queued.",
+            task_id=job["id"],
+            job_id=job["id"],
+            repo=repo,
+        )
+
+    @app.get("/api/v1/jobs", response_model=list[JobResponse], tags=["operations"])
+    def list_jobs(request: Request, repo: str | None = None, limit: int = 50,
+                  _: None = Security(_verify_key)):
+        return [_job(r) for r in request.app.state.jobs.list(repo=repo, limit=max(1, min(limit, 200)))]
+
+    @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse, tags=["operations"])
+    def get_job(job_id: str, request: Request, _: None = Security(_verify_key)):
+        row = request.app.state.jobs.get(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _job(row)
+
+    @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobResponse, tags=["operations"])
+    def cancel_job(job_id: str, request: Request, _: None = Security(_verify_key)):
+        row = request.app.state.runner.cancel(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return _job(row)
+
+    @app.get("/api/v1/status/{task_id}", tags=["operations"])
+    def task_status(task_id: str, request: Request, _: None = Security(_verify_key)):
+        """Backward-compatible alias for GET /api/v1/jobs/{id}."""
+        row = request.app.state.jobs.get(task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"task_id": task_id, **_job(row).model_dump()}
+
+    return app
+
+
+app = create_app()

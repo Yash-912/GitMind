@@ -10,11 +10,10 @@ app = typer.Typer(no_args_is_help=True)
 
 
 @app.command()
-def answer(query: str, mode: str = "direct") -> None:
-    """Run retrieval + generation for a single query."""
+def answer(query: str, repo: str, mode: str = "direct") -> None:
+    """Run scoped retrieval + generation for a single query."""
     import sys
-    sys.argv = ["run_answer.py", query, "--mode", mode]
-    run_answer_main()
+    sys.exit(run_answer_main([query, "--repo", repo, "--mode", mode]))
 
 
 @app.command()
