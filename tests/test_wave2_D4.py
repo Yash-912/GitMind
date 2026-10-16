@@ -36,6 +36,16 @@ def cand(cid: str, score: float = 0.5, **meta):
     return SimpleNamespace(chunk_id=cid, score=score, source="dense", text=f"text {cid}", metadata=base)
 
 
+class _FakeQdrant:
+    def __init__(self, service):
+        self.service, self.up = service, True
+
+    def count(self):
+        if not self.up:
+            raise ConnectionError("qdrant down")
+        return 3
+
+
 class FakeService:
     def __init__(self, gen, *, candidates=None, included=None, error=None, gate=None):
         self.gen = gen
@@ -45,8 +55,14 @@ class FakeService:
         self.gate = gate
         self.calls: list = []
         self.closed = False
-        self.qdrant_reachable = True
         self.reranker_available = True
+        self.startup_warnings: list[str] = []
+        # Mirrors the real service: Qdrant is reached through retriever.qdrant.
+        self.retriever = SimpleNamespace(qdrant=_FakeQdrant(self))
+
+    @property
+    def qdrant_reachable(self) -> bool:
+        return self.retriever.qdrant.up
 
     def retrieve(self, question, scope, top_k=12, limit=40):
         self.calls.append((question, scope, top_k, limit))
@@ -331,7 +347,7 @@ def test_ready_reports_generation_details(make_client):
 def test_ready_lists_degraded_components_explicitly(make_client):
     c = make_client()
     svc = c.services[0]
-    svc.qdrant_reachable, svc.reranker_available = False, False
+    svc.retriever.qdrant.up, svc.reranker_available = False, False
     r = c.get("/ready")
     assert r.status_code == 503
     repo = r.json()["repos"][0]
