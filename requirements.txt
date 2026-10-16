@@ -35,8 +35,8 @@ jinja2~=3.1.6                       # [verified]
 pydantic~=2.14.1                    # [verified]
 
 # Phase 6 — Evaluation
-ragas~=0.2                          # [unverified]
-mlflow~=2.16                        # [unverified]
+ragas~=0.4.3                        # [verified: live RAGAS run]
+mlflow~=3.17.1                       # [verified: evaluation tests]
 
 # Phase 7 — Interface
 streamlit~=1.40                     # [unverified] UI uses st.fragment(run_every=...) (>=1.37)
