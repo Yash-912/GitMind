@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import queue
 import sqlite3
 import subprocess
@@ -19,7 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -30,7 +31,10 @@ TERMINAL = {SUCCEEDED, FAILED, CANCELLED}
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-Step = tuple[str, list[str]]   # (label, argv)
+# (label, argv). argv may be a callable receiving the values captured from
+# earlier steps' output (e.g. GENERATION_ID=... printed by phase 2).
+Step = tuple[str, Any]
+GENERATION_LINE = re.compile(r"^GENERATION_ID=(\S+)\s*$")
 
 
 class QueueFullError(RuntimeError):
@@ -134,8 +138,18 @@ class JobStore:
             return cur.rowcount
 
 
+def _phase3_argv(repo_id: str):
+    def build(captured: dict) -> list[str]:
+        gid = captured.get("GENERATION_ID")
+        if not gid:
+            raise RuntimeError("parse/chunk did not report a GENERATION_ID")
+        return [sys.executable, "-u", "scripts/run_phase3.py",
+                "--repo", repo_id, "--generation", gid]
+    return build
+
+
 def default_steps(repo_id: str, params: dict) -> list[Step]:
-    """ingest -> parse/chunk -> embed/index into a new generation."""
+    """ingest -> parse/chunk (creates a building generation) -> embed/index into it."""
     py = [sys.executable, "-u"]
     ingest = py + ["scripts/ingest.py"]
     github_repo, repo_path = params.get("github_repo"), params.get("repo_path")
@@ -148,7 +162,7 @@ def default_steps(repo_id: str, params: dict) -> list[Step]:
     return [
         ("ingest", ingest),
         ("parse and chunk", py + ["scripts/run_phase2.py", "--repo", repo_id]),
-        ("embed and index", py + ["scripts/run_phase3.py", "--repo", repo_id, "--generation"]),
+        ("embed and index", _phase3_argv(repo_id)),
     ]
 
 
@@ -270,15 +284,24 @@ class JobRunner:
         cancel = self._cancel.get(job_id) or threading.Event()
         params = self.store.get(job_id)["params"]  # type: ignore[index]
         steps = list(self._steps(repo, params))
+        captured: dict[str, str] = {}
         deadline = time.monotonic() + self._timeout_s
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
 
         for index, (label, argv) in enumerate(steps, start=1):
             prefix = f"step {index}/{len(steps)}: {label}"
             self.store.update(job_id, progress=prefix)
+            try:
+                resolved = argv(captured) if callable(argv) else argv
+            except Exception as exc:
+                self.store.update(
+                    job_id, status=FAILED, finished_at=_now(),
+                    error=f"{label}: {exc}"[:1000],
+                )
+                return
             tail: list[str] = []
             proc = subprocess.Popen(
-                list(argv), cwd=self._cwd, env=env, stdout=subprocess.PIPE,
+                list(resolved), cwd=self._cwd, env=env, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             )
             self._procs[job_id] = proc
@@ -289,6 +312,9 @@ class JobRunner:
                     line = line.rstrip()
                     if not line:
                         continue
+                    found = GENERATION_LINE.match(line)
+                    if found:
+                        captured["GENERATION_ID"] = found.group(1)
                     tail.append(line)
                     del tail[:-20]
                     now = time.monotonic()

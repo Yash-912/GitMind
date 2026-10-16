@@ -95,6 +95,16 @@ def create_app(
     jobs_db: str | Path | None = None,
     coverage_fn: Callable[[Any], bool] | None = None,
 ) -> FastAPI:
+    if Path(settings.generations_dir).resolve() != (
+        Path(settings.data_dir) / "generations"
+    ).resolve():
+        # Phase 2 always writes under DATA_DIR/generations; a different root
+        # would publish generations the API never reads.
+        raise ValueError(
+            "GENERATIONS_DIR must equal DATA_DIR/generations: scripts/run_phase2.py "
+            "writes there and the API reads from settings.generations_dir"
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         registry_kwargs = {"service_factory": service_factory} if service_factory else {}
