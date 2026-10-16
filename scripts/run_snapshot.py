@@ -64,6 +64,28 @@ def _is_snapshot(record: dict[str, Any]) -> bool:
     return record.get("metadata", {}).get("scope") == "snapshot"
 
 
+def merge_into_generation(
+    gen: Generation,
+    history: list[dict[str, Any]],
+    snapshot: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """The single writer of a generation's ``chunks.jsonl``.
+
+    ``history`` replaces every history record (snapshot records passed there are
+    ignored). ``snapshot`` replaces the snapshot records; when ``None`` the
+    snapshot records already in the file are kept as they are, so a history-only
+    rebuild never deletes code chunks it did not rebuild. Returns the snapshot
+    records now in the file.
+    """
+    if snapshot is None:
+        snapshot = [r for r in read_jsonl(gen.chunks_path) if _is_snapshot(r)]
+    write_jsonl_atomic(
+        gen.chunks_path,
+        [r for r in history if not _is_snapshot(r)] + list(snapshot),
+    )
+    return list(snapshot)
+
+
 def run_snapshot(
     repo_path: str | Path,
     repo: str,
@@ -106,7 +128,7 @@ def run_snapshot(
         gen = mgr.new_generation(commit=result.inventory.commit)
         history = [r for r in active_records if not _is_snapshot(r)]
 
-    write_jsonl_atomic(gen.chunks_path, history + result.records)
+    merge_into_generation(gen, history, result.records)
     result.manifest.save(gen.path / MANIFEST_NAME)
 
     inv = result.inventory

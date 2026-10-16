@@ -87,7 +87,50 @@ class TemporalGraphBuilder:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._conn = _get_connection(db_path)
+        self._run_repo: str | None = None
+        self._emitted_edges: set[tuple[str, str, str, str, str]] = set()
+        self._emitted_nodes: set[str] = set()
         self._setup_tables()
+
+    # ------------------------------------------------------------------
+    # Re-run bookkeeping: remove what a run no longer emits
+    # ------------------------------------------------------------------
+
+    def begin_run(self, repo: str) -> None:
+        """Start tracking the edges/nodes (re-)emitted for ``repo`` by this run."""
+        self._run_repo = repo
+        self._emitted_edges = set()
+        self._emitted_nodes = set()
+
+    def prune_stale(self) -> dict[str, int]:
+        """Delete ``repo`` edges/nodes this run did not re-emit (other repos untouched)."""
+        if self._run_repo is None:
+            raise RuntimeError("prune_stale() requires begin_run(repo)")
+        repo = self._run_repo
+        stale_edges = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT id, source_type, source_id, target_type, target_id, relation"
+                " FROM graph_edges WHERE repo = ?",
+                (repo,),
+            )
+            if tuple(r[1:]) not in self._emitted_edges
+        ]
+        for edge_id in stale_edges:
+            self._conn.execute("DELETE FROM graph_edges WHERE id = ?", (edge_id,))
+        stale_nodes = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT node_id FROM graph_nodes WHERE repo = ?", (repo,)
+            )
+            if r[0] not in self._emitted_nodes
+        ]
+        for node_id in stale_nodes:
+            self._conn.execute(
+                "DELETE FROM graph_nodes WHERE repo = ? AND node_id = ?", (repo, node_id)
+            )
+        self._conn.commit()
+        return {"edges_removed": len(stale_edges), "nodes_removed": len(stale_nodes)}
 
     _EDGE_DDL = """
         CREATE TABLE IF NOT EXISTS graph_edges (
@@ -161,6 +204,8 @@ class TemporalGraphBuilder:
         event_time: str | None = None,
         foreign_repo: str = "",
     ) -> None:
+        if self._run_repo is not None and repo == self._run_repo:
+            self._emitted_nodes.add(f"{node_type}_{node_ref}")
         self._conn.execute(
             """
             INSERT INTO graph_nodes (repo, node_id, node_type, node_ref, foreign_repo, event_time)
@@ -170,6 +215,8 @@ class TemporalGraphBuilder:
             """,
             (repo, f"{node_type}_{node_ref}", node_type, node_ref, foreign_repo, event_time),
         )
+        # Commit now: other connections (the entity registry) write to the same file.
+        self._conn.commit()
 
     def add_edge(
         self,
@@ -191,6 +238,10 @@ class TemporalGraphBuilder:
         ``target_id`` must already carry the namespace (``owner/repo#7``).
         Re-adding an edge refreshes its provenance when new values are given.
         """
+        if self._run_repo is not None and repo == self._run_repo:
+            self._emitted_edges.add(
+                (source_type, source_id, target_type, target_id, relation)
+            )
         self._conn.execute(
             """
             INSERT INTO graph_edges
