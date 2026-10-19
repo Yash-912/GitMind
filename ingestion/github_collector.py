@@ -288,7 +288,8 @@ class GitHubAPICollector:
         }
         runs: list[WorkflowRunRecord] = []
         page = 1
-        with httpx.Client(timeout=60.0) as client:
+        # GitHub answers the repo-name URL with a 301 to the numeric repository id.
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
             while limit is None or len(runs) < limit:
                 resp = client.get(
                     url, headers=headers, params={"per_page": per_page, "page": page}
