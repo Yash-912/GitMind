@@ -294,6 +294,9 @@ class GitHubAPICollector:
                 resp = client.get(
                     url, headers=headers, params={"per_page": per_page, "page": page}
                 )
+                # GitHub rejects pages past its listing cap with 422; that is the end of the history.
+                if resp.status_code == 422 and page > 1:
+                    break
                 resp.raise_for_status()
                 data = resp.json()
                 for run in data.get("workflow_runs", []):
